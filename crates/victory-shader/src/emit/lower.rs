@@ -4186,6 +4186,31 @@ impl<'a> Lower<'a> {
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
+    /// This lane's bit of an inline-constant lane mask. `0` is no lane and
+    /// `-1` every lane whatever the wave size, so those need no lane
+    /// number; any other pattern names console lanes, so host lanes have
+    /// to be the console's.
+    fn constant_mask(&mut self, code: u8, at: usize) -> Result<V, Why> {
+        let x = crate::resource::inline(code).ok_or("a select on an untracked mask")?;
+        if x == 0 || x == u32::MAX {
+            return Ok(self.s.m.bool(x != 0));
+        }
+        if self.mask_data != MaskData::Console {
+            return Err("a constant lane mask");
+        }
+        // Each host wave taken as a wave of its own has no console lane
+        // numbers to pick the bits by.
+        if self.local {
+            return Err("a constant lane mask in a half-wave");
+        }
+        let lo = self.s.m.i32(x);
+        // wave64: the constant is sign-extended into lanes 32-63.
+        let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
+        let hi = self.x.native.wave64.then_some(hi);
+        self.cross_lane(false)?;
+        Ok(self.lane_bit(at, lo, hi))
+    }
+
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let lane = if self.exchange.is_some() {
@@ -7760,40 +7785,55 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
-                };
                 const UNTRACKED: Why = "a select on an untracked mask";
-                let cond = match mask.and_then(|m| self.x.st.masks.get(&m).copied()) {
-                    Some(m) => self.boolean(m, c)?,
-                    // A mask the code holds as a number (a constant bit
-                    // pattern: every other lane, every other pair...):
-                    // this lane's bit of it. Exact where host lanes are
-                    // the console's.
-                    None if self.mask_data == MaskData::Console => {
-                        // Each host wave taken as a wave of its own has no
-                        // console lane numbers to pick the bits by.
-                        if self.local {
-                            return Err("a constant lane mask in a half-wave");
-                        }
-                        let m = mask.ok_or(UNTRACKED)?;
-                        let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
-                        // wave64: the register after it holds lanes 32-63.
-                        let high = match v.src.get(2) {
-                            Some(&Operand::Scalar { code, .. }) if self.x.native.wave64 => {
-                                Some(inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?)
-                            }
+                let cond = match v.src.get(2) {
+                    // An inline constant names the lanes itself: no
+                    // register holds the mask to look it up by.
+                    Some(&Operand::Const(code)) => self.constant_mask(code, c)?,
+                    src2 => {
+                        let mask = match src2 {
+                            Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                             _ => None,
                         };
-                        let hi = match high {
-                            Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
-                            None => None,
-                        };
-                        self.cross_lane(false)?;
-                        self.lane_bit(c, lo, hi)
+                        // Structurisation resolves a mask from EXEC or a
+                        // VALU result into `masks`; one it cannot (a
+                        // uniform select, an opaque value) it leaves in
+                        // `other` for its uses to resolve.
+                        let tracked = mask.and_then(|m| {
+                            let st = self.x.st;
+                            st.masks.get(&m).or_else(|| st.other.get(&m)).copied()
+                        });
+                        match tracked {
+                            Some(m) => self.boolean(m, c)?,
+                            // A mask the code holds as a number (a constant
+                            // bit pattern: every other lane, every other
+                            // pair...): this lane's bit of it. Exact where
+                            // host lanes are the console's.
+                            None if self.mask_data == MaskData::Console => {
+                                // Each host wave taken as a wave of its own
+                                // has no console lane numbers to pick by.
+                                if self.local {
+                                    return Err("a constant lane mask in a half-wave");
+                                }
+                                let m = mask.ok_or(UNTRACKED)?;
+                                let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
+                                // wave64: the next register holds lanes 32-63.
+                                let high = match src2 {
+                                    Some(&Operand::Scalar { code, .. }) if self.x.native.wave64 => {
+                                        Some(inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?)
+                                    }
+                                    _ => None,
+                                };
+                                let hi = match high {
+                                    Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
+                                    None => None,
+                                };
+                                self.cross_lane(false)?;
+                                self.lane_bit(c, lo, hi)
+                            }
+                            None => return Err(UNTRACKED),
+                        }
                     }
-                    None => return Err(UNTRACKED),
                 };
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -11991,6 +12031,27 @@ mod tests {
     }
 
     #[test]
+    fn v_cndmask_takes_a_uniform_or_constant_lane_mask() {
+        // A mask structurisation cannot derive from EXEC or a VALU result:
+        // `s_cselect_b32 s0, -1, 0`, which is every lane or none by its
+        // SCC, and the inline constants -1 (every lane) and 0 (none).
+        // Without them the uniform select fell through to the numeric
+        // path, which has no console lane numbers here, and the constants
+        // were refused outright.
+        let body = [
+            0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
+            0x8500_80C1,    // s_cselect_b32 s0, -1, 0
+            0xD501_0000,
+            0x0002_0280, // v_cndmask_b32 v0, 0, v1, s0
+            0xD501_0000,
+            0x0306_0080, // v_cndmask_b32 v0, 0, v0, -1
+            0xD501_0000,
+            0x0202_0080, // v_cndmask_b32 v0, 0, v0, 0
+        ];
+        lowers_valu(&body).unwrap();
+    }
+
+    #[test]
     fn a_d16_typed_buffer_load_packs_its_channels() {
         // MTBUF format:27 (16_16_UINT) into v0, from s[8:11]:
         // tbuffer_load_format_xy (opcode 1) and tbuffer_load_format_d16_xy
@@ -12073,6 +12134,24 @@ mod tests {
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn v_cndmask_accepts_uniform_and_constant_masks() {
+        // Uniform select (`s_cselect_b32`) and inline constant masks in `v_cndmask_b32`
+        // (resolved in `Structured::other` or directly as constants).
+        let words = [
+            0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
+            0x8500_80C1,    // s_cselect_b32 s0, -1, 0
+            0xD501_0001,
+            0x0001_0080, // v_cndmask_b32 v1, 0, 1, s0
+            0xD501_0002,
+            0x0201_02C1, // v_cndmask_b32 v2, 1, v1, -1
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        lowers(&words, 0x8001).unwrap();
     }
 
     fn perm_features(selector: u32) -> u64 {
