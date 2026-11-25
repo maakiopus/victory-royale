@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import zipfile
 
 REPO = "ligmaSec/victory-royale"
@@ -106,7 +107,6 @@ def launch(side, folder, title, results, windows):
         command = ["bash", str(folder / "victory-proton.sh"), "--report", "--runtime", "pinned", *args]
     console = results / (side + ".log")
     report = None
-    print(f"Starting {side}.", flush=True)
     with console.open("wb") as log, subprocess.Popen(command, cwd=title.parent, env=env,
                                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
         with process.stdout:
@@ -243,14 +243,24 @@ def run():
             run_request(manifest, options)
 
 
+def instruction_block(heading, message, path_line=None):
+    width = max(20, min(72, shutil.get_terminal_size().columns - 1))
+    rule = "=" * width
+    message = textwrap.fill(message, width, break_long_words=False, break_on_hyphens=False)
+    lines = ["", rule, textwrap.fill(heading, width), rule, message]
+    if path_line:
+        lines.extend(["", path_line])
+    print("\n".join(lines), end="\n\n", flush=True)
+
+
 def run_request(manifest, options):
     request = read_request(manifest)
-    print(f"VIctory PR #{request['pr']} | Series X | two launches\n{request['scenario']}")
-    for side in ("main", "candidate"):
-        build = request[side]
-        print(f"{side}: {build['revision'][:12]}  https://github.com/{REPO}/actions/runs/{build['run']}")
-    print("Reports stay on this computer. Nothing is uploaded automatically.", flush=True)
+    print(f"VIctory PR #{request['pr']} | Series X | two launches", flush=True)
     if options.plan:
+        for side in ("main", "candidate"):
+            build = request[side]
+            print(f"{side}: {build['revision'][:12]}  https://github.com/{REPO}/actions/runs/{build['run']}")
+        instruction_block("TEST INSTRUCTIONS", request["scenario"])
         return
     windows = sys.platform == "win32"
     if not windows and not sys.platform.startswith("linux"):
@@ -261,10 +271,9 @@ def run_request(manifest, options):
     title = (options.title or choose_title()).expanduser().resolve()
     if not title.is_file() or title.suffix.lower() != ".exe":
         raise ValueError("Select the game's .exe file.")
-    state = os.getenv("LOCALAPPDATA" if windows else "XDG_STATE_HOME")
-    default_home = Path(state) if state and Path(state).is_absolute() else Path.home() / ".local" / "state"
-    output = (options.output_dir or default_home / "victory" / "reports").expanduser().resolve()
-    for directory in (output, Path(tempfile.gettempdir()).resolve(), title.parent):
+    temp = Path(tempfile.gettempdir()).resolve()
+    output = (options.output_dir or temp).expanduser().resolve()
+    for directory in (output, temp, title.parent):
         if any((parent / ".victory-root").exists() for parent in (directory, *directory.parents)):
             raise ValueError("Use a game, temporary directory and report destination outside the VIctory checkout.")
     with tempfile.TemporaryDirectory(prefix="victory-builds-") as work:
@@ -276,19 +285,23 @@ def run_request(manifest, options):
         shutil.copyfile(manifest, results / "request.json")
         complete = False
         try:
-            for side in ("main", "candidate"):
+            for number, side in enumerate(("main", "candidate"), start=1):
+                instruction_block(f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO", request["scenario"])
                 launch(side, Path(work) / side, title, results, windows)
             complete = True
         finally:
             if any(results.glob("*.log")):
                 output.mkdir(parents=True, exist_ok=True)
-                destination = Path(tempfile.mkdtemp(prefix=f"pr{request['pr']}-", dir=output))
+                destination = Path(tempfile.mkdtemp(prefix=f"victory-pr{request['pr']}-", dir=output))
                 bundle = destination / "report.zip"
                 with zipfile.ZipFile(bundle, "x", zipfile.ZIP_DEFLATED, compresslevel=1) as out:
                     for path in sorted(results.iterdir()):
                         out.write(path, path.name)
                 label = "Upload" if complete else "Partial report"
-                print(f"{label}: {bundle}", flush=True)
+                heading = "REPORT READY" if complete else "TEST INTERRUPTED"
+                instruction_block(heading,
+                                  "Send this ZIP privately to the person who requested the test. Keep it zipped.",
+                                  f"{label}: {bundle}")
 
 
 if __name__ == "__main__":

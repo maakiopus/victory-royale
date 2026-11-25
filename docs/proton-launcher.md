@@ -69,6 +69,8 @@ to the standard directories under `$HOME`.
 
 ## Capture a workstation run
 
+For a requested PR comparison, follow the [interactive Series X test](testing.md#run-a-series-x-hardware-test). It runs both builds and bundles their logs. To capture a single launch, use the command below.
+
 ```sh
 ./scripts/victory-proton.sh --report "/path/to/game/title.exe"
 ```

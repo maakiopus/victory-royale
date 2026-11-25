@@ -6,12 +6,13 @@ If this is your first contribution, try one test and tell us what happened.
 You can help without writing a patch. A result from a second machine can
 show whether a failure follows a particular build, GPU driver, or setting.
 
-- **Have a game and a Linux workstation?** Install UMU (`umu-run`) and extract a tested
+- **Testing a pull request?** Use the [interactive Series X test](docs/testing.md#run-a-series-x-hardware-test) on Windows or Linux/Proton. Pick the PR, follow the same scenario twice, and return the ZIP privately to the requester.
+- **Reporting a single Linux run?** Install UMU (`umu-run`) and extract a tested
   [Proton build](docs/testing.md#ci-and-build-downloads). From its `victory`
   directory, run `./victory-proton.sh --report "/path/to/title.exe"`.
   If you built from a checkout, use the same arguments with
   `./scripts/victory-proton.sh`.
-- **Testing on Windows?** Follow the [Windows build and launch instructions](README.md#getting-started).
+- **Reporting a single Windows run?** Follow the [Windows build and launch instructions](README.md#getting-started).
   Keep the terminal output from the run. For a crash, check the newest entry
   in the title's `crashes.log` and confirm its timestamp matches your run.
 - **Have a checkout but no game files?** On Linux, `./scripts/victory-proton.sh --test`

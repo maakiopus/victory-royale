@@ -220,6 +220,10 @@ loads the world, where rendering fails.
 
 Tested on one machine: Windows 11, AMD RX 6700 XT.
 
+Testing a pull request on Windows or Linux/Proton? The [interactive Series X test](docs/testing.md#run-a-series-x-hardware-test) runs both builds and gives you one ZIP to send back.
+
+## Run on Linux
+
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
 > moment). To look further, use a diagnostics build with

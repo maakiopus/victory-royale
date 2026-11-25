@@ -39,9 +39,8 @@ the full UMU/Proton runtime still require a separate workstation test.
 Successful main builds deliver `victory-proton-x86_64-<commit>` for 14 days.
 Code PRs deliver `victory-proton-x86_64-pr-<number>-<merge-commit>` for three
 days. The latter contains the revision GitHub tested with the base branch.
-For a hardware comparison, use a build of that PR run's base commit, building
-it locally if it has no artifact. Keep each download in a separate directory
-and report each `victory/REVISION`. Windows testers can run the extracted
+For a requested comparison, use the [interactive Series X test](#run-a-series-x-hardware-test)
+to get both matched builds. For a single run, Windows testers can launch the extracted
 `victory.exe` with the [usual Windows launch command](../README.md#getting-started).
 
 Download the artifact from the CI run, unzip the Actions download, and run
@@ -54,34 +53,60 @@ tar -xf victory-proton-x86_64.tar.gz
 ./victory/victory-proton.sh --run "/path/to/game/title.exe"
 ```
 
+## Run a Series X hardware test
+
+You'll need Python 3.9 or newer and your own title executable outside the VIctory checkout.
+On Linux, install Bash and UMU (`umu-run`). The Proton launcher may download its pinned
+runtime on first use.
+
+| Start here | Linux/Proton | Windows (PowerShell) |
+| --- | --- | --- |
+| From the repository root, choose a published PR | `python3 scripts/hardware-test/run-test.py` | `py scripts/hardware-test/run-test.py` |
+| With a kit ZIP, extract it and open a terminal in the folder containing `run-test.py` | `python3 run-test.py` | `py run-test.py` |
+
+The checkout menu uses a signed-in GitHub CLI (`gh auth login`). Type the PR number
+shown in the menu, or press Enter to cancel. If a request includes a number, you
+can append it directly to the checkout command. Add `--plan` to preview the scenario
+and build revisions. An extracted kit includes both builds and needs no GitHub login.
+
+1. Select your game's `.exe` when prompted. The runner checks both packages and starts
+   **main** first. Follow **WHAT TO DO** above the launch and close the game at the point
+   specified in the scenario.
+2. The **candidate** opens next. Repeat the same steps with the same settings and window
+   size. The runner gives each build its own fresh translation cache.
+3. At **REPORT READY**, send the intact `report.zip` at the **Upload:** path to the
+   private destination in the request, or directly to the requester. The runner leaves
+   it in a new system temporary folder after exit. Send it before the system cleans
+   that folder. If the runner prints **Partial report:**, send that file and say
+   which run stopped.
+
+Tell the requester what you saw on each build. For example, say whether the first
+scene showed roads and vehicles or only lights and subtitles. Include your OS,
+GPU and driver. Keep full logs and archives private. See the [asset policy](asset-policy.md)
+for what you can share on GitHub.
+
 ## Requesting a hardware comparison
 
-From a checkout, run `python3 scripts/hardware-test/run-test.py` to choose
-a published Series X test. For a targeted request, send the same command
-with the PR number as its only argument. Windows users can use `py` in
-place of `python3`. Add `--plan` to preview the scenario and revisions.
+Run the [hardware kit workflow](../.github/workflows/hardware-request.yml) on
+`main` with the PR number and a short Series X scenario. Specify where to start,
+what to observe and when to close each run. Once it succeeds, send the tester the
+checkout command for their OS with the PR number appended, plus the private report
+destination. The menu also lists the request. If the PR head changes or the kit
+expires, publish a fresh kit for the current revision.
 
-Published requests use a signed-in GitHub CLI. Testers with a kit ZIP can
-pass its path instead, or extract it and run `python3 run-test.py` from the
-extracted folder. The runner prompts for the game executable, verifies the
-two CI packages, launches both with fresh translation caches, and prints
-one private report path.
-
-Maintainers can run the [hardware kit workflow](../.github/workflows/hardware-request.yml)
-on main and share its ZIP, or prepare it from a trusted checkout using a
-signed-in GitHub CLI:
+For testers without a checkout, share the kit ZIP. To prepare one locally with a
+signed-in GitHub CLI, run this from a trusted checkout, replacing `PR_NUMBER` with
+the number of the PR.
 
 ```sh
 python3 scripts/hardware-test/prepare.py PR_NUMBER --output test-kit.zip \
-  --scenario "Wait at the menu for ten seconds. Enter the first scene. Close each run at the first subtitle."
+  --scenario "Wait ten seconds at the menu. Enter the opening scene. Close each run at the first subtitle."
 ```
 
-The packager matches the successful PR build to its tested main parent and
-checks both artifact digests. If either artifact has expired, refresh the
-build pair first.
-The kit contains both unmodified CI distributions, the runner,
-instructions, license and request JSON. A full kit needs no tester GitHub login. Future requests can share just the JSON with the same runner.
-Testers share reports privately. Post configuration and measurements on the PR.
+The packager matches the successful PR build to its tested main parent and checks
+both artifact digests. If either build has expired, refresh the pair first.
+Post the tested revisions, configuration and observed differences on the PR. For
+performance comparisons, include frame times and stalls alongside average or median FPS.
 
 ## What the host needs
 

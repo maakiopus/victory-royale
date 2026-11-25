@@ -160,6 +160,33 @@ class HardwareRequest(unittest.TestCase):
                 mock.patch.object(runner, "launch", side_effect=launch), contextlib.redirect_stdout(io.StringIO()):
             runner.run()
 
+    def test_instructions_at_launch_and_private_zip_in_temp(self):
+        shutil.copy(self.package, self.packages / (self.build["sha256"] + ".tar.gz"))
+        temp = self.root / "system temp with spaces"
+        temp.mkdir()
+        stdout = io.StringIO()
+
+        def launched(side, folder, title, results, windows):
+            number = 1 if side == "main" else 2
+            lines = stdout.getvalue().rstrip().splitlines()
+            self.assertEqual(lines[-3], f"RUN {number} OF 2  |  {side.upper()}  |  WHAT TO DO")
+            self.assertEqual(lines[-1], self.request["scenario"])
+            (results / (side + ".log")).write_text(side)
+
+        args = ["runner", str(self.manifest), "--title", str(self.title)]
+        with mock.patch.object(sys, "argv", args), mock.patch.object(tempfile, "tempdir", str(temp)), \
+                mock.patch.dict(os.environ, {"COLUMNS": "52"}), \
+                mock.patch.object(shutil, "which", return_value="tool"), \
+                mock.patch.object(runner, "launch", side_effect=launched), contextlib.redirect_stdout(stdout):
+            runner.run()
+        report, = temp.rglob("*.zip")
+        self.assertEqual(list(temp.iterdir()), [report.parent])
+        self.assertIn("REPORT READY", stdout.getvalue())
+        self.assertIn("Send this ZIP privately", stdout.getvalue())
+        self.assertEqual(stdout.getvalue().rstrip().splitlines()[-1], f"Upload: {report}")
+        with zipfile.ZipFile(report) as archive:
+            self.assertEqual(set(archive.namelist()), {"request.json", "main.log", "candidate.log"})
+
     def test_fresh_pair_and_partial(self):
         def launched(side, folder, title, results, windows):
             self.assertEqual(title, self.title)
