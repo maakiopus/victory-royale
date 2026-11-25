@@ -266,6 +266,7 @@ mod tests {
         assert!(check("tests/metal/generate.py", b"import struct").is_empty());
         assert!(check("tests/metal/run.py", b"import subprocess").is_empty());
         assert!(check("tests/metal/probe.swift", b"import Metal").is_empty());
+        assert!(check("tools/linux-sweep/analyze.py", b"import re").is_empty());
 
         assert!(!check("other.py", b"pass").is_empty());
         assert!(!check("other.swift", b"import Metal").is_empty());
