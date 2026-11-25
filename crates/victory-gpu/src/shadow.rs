@@ -3127,11 +3127,38 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    BUFFER_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    if buffers().remove(&(start, resource)).is_some() {
+        BUFFER_GENERATION.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Bumped whenever a title buffer appears, goes, or loses its in-place copy:
+/// a root view recorded earlier in a list may then name another buffer at
+/// the same address (`draw.rs` `RootSlot`).
+static BUFFER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The current [`BUFFER_GENERATION`].
+pub(crate) fn buffer_generation() -> u64 {
+    BUFFER_GENERATION.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+#[test]
+fn buffers_coming_and_going_move_the_generation() {
+    // An address no title buffer of another test uses.
+    let start = 0x7FFF_0000_0000;
+    let before = buffer_generation();
+    register(1, start, 64);
+    let registered = buffer_generation();
+    assert!(registered > before);
+    unregister(1, start);
+    let released = buffer_generation();
+    assert!(released > registered);
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -3172,6 +3199,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n != 0 {
+        BUFFER_GENERATION.fetch_add(1, Ordering::Release);
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
