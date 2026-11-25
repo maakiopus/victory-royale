@@ -348,6 +348,43 @@ pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 
+/// The host view whose size (and address) stand in for a descriptor's
+/// dwords read as numbers (`descriptor_words`).
+#[derive(Clone, Copy, Default)]
+struct View {
+    /// The descriptor's first dword in the load.
+    first: u8,
+    /// The handle's resource properties.
+    props: (u32, u32),
+    /// The image kind; none for a buffer.
+    image: Option<u32>,
+    uav: bool,
+    /// A buffer's bytes per record (its used-resource entry's).
+    stride: u32,
+    /// A buffer's address is wanted whether or not the code computes with it.
+    address: bool,
+}
+
+/// The first SGPR and dword count of an `s_load_dword*`.
+fn load_dwords(inst: &Inst) -> Option<(u8, u32)> {
+    let Fields::Smem {
+        data: Some(Operand::Scalar { code, .. }),
+        ..
+    } = inst.fields
+    else {
+        return None;
+    };
+    let count = match inst.name().strip_prefix("s_load_dword")? {
+        "" => 1,
+        "x2" => 2,
+        "x4" => 4,
+        "x8" => 8,
+        "x16" => 16,
+        _ => return None,
+    };
+    Some((code, count))
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
@@ -2921,29 +2958,50 @@ impl<'a> Lower<'a> {
     /// up; code that takes the address masks those away.)
     fn view_address(&mut self, site: Site) -> Option<(V, V)> {
         use super::shader::USER_VIEW_ADDRESS;
+        self.view_entry(site)?;
         let a = self.scalar.get(&site).copied()?;
-        let rp = *self.x.native.layout.get(a.param)?;
+        let slot = self.x.native.layout.get(a.param)?.slot;
+        let dword = a.offset / 4;
+        let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), slot, dword);
+        let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), slot, dword);
+        Some((lo, hi))
+    }
+
+    /// The used-resource entry of the buffer view (SRV or UAV) whose
+    /// descriptor the scalar load at `site` reads from the start of a table
+    /// entry at a fixed place; none for anything else.
+    fn view_entry(&self, site: Site) -> Option<&'a UsedResource> {
+        let a = self.scalar.get(&site)?;
+        let rp = self.x.native.layout.get(a.param)?;
         if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
             return None;
         }
-        let dword = a.offset / 4;
-        let used = self
-            .x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
-            })
-            .max_by_key(|u| u.table_offset_dwords)?;
-        if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
-            return None;
-        }
-        let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
-        let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
-        Some((lo, hi))
+        self.used_kind(&Source::Loaded {
+            load: site,
+            first: 0,
+        })
+        .filter(|u| u.dwords == 4 && matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
+    }
+
+    /// Whether the load `inst` at `site` (into `s[code..]`) reads an image
+    /// descriptor from the view heap and the code never reads its dwords
+    /// from 4 on (an image's depth or layers, which would tell a 2D texture
+    /// from a 3D one or an array).
+    fn heap_sized_2d(&self, inst: &Inst, site: Site, code: u8) -> bool {
+        let heap = self
+            .scalar
+            .get(&site)
+            .and_then(|a| self.x.native.layout.get(a.param))
+            .is_some_and(|p| p.root == RootType::ResourceHeap);
+        let read = |v: Value| {
+            self.x
+                .p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.reads.iter().any(|r| r.1 == v))
+        };
+        heap && (4..8u8).all(|k| inst.write(Reg::S(code + k)).is_none_or(|v| !read(v)))
     }
 
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
@@ -6111,22 +6169,7 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
-        let Fields::Smem {
-            data: Some(Operand::Scalar { code, .. }),
-            ..
-        } = inst.fields
-        else {
-            return Err("a scalar memory read as data");
-        };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
-        };
+        let (code, count) = load_dwords(inst).ok_or("a scalar memory read as data")?;
         // How the program uses the descriptor tells the view's kind: an image or buffer
         // instruction before a scalar buffer load, which reads any buffer.
         let x = self.x;
@@ -6195,26 +6238,42 @@ impl<'a> Lower<'a> {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a sampler's descriptor read as data");
             }
-            // A buffer view the code only takes the address of, to walk
-            // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
+            let start = Source::Loaded {
+                load: site,
+                first: 0,
+            };
+            // A buffer view from a table entry that nothing reads through: the code takes
+            // its address (to walk the memory behind it, a ray-tracing structure) or its
+            // record count (to skip an empty one), both from the host view.
             if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
+                && let Some(used) = self.view_entry(site)
             {
-                for k in 0..count {
-                    let reg = Reg::S(code + k as u8);
-                    match k {
-                        0 => self.write(inst, reg, lo, None),
-                        1 => self.write(inst, reg, hi, None),
-                        _ => {
-                            if let Some(v) = inst.write(reg) {
-                                self.vals.insert(v, Val::Missing(OTHER));
-                                self.stale.insert(v);
-                            }
-                        }
-                    }
-                }
-                return Ok(());
+                let u = if used.kind == ResourceType::Uav {
+                    0x1000
+                } else {
+                    0
+                };
+                let view = View {
+                    props: (11 | u, 0),
+                    uav: u != 0,
+                    stride: used.stride,
+                    address: true,
+                    ..View::default()
+                };
+                return self.descriptor_words(inst, site, &start, view);
+            }
+            // An image from the heap the code only takes the size of (its width, height
+            // and levels from dwords 1-3, for another image's coordinates), never its
+            // depth: sized as a 2D texture.
+            // shortcut: a 2D array, or a UAV image, read this way sizes the same on
+            // RADV and the AMD driver, which read the size from the host descriptor.
+            if count == 8 && self.heap_sized_2d(inst, site, code) {
+                let view = View {
+                    props: (2, 0x409),
+                    image: Some(2),
+                    ..View::default()
+                };
+                return self.descriptor_words(inst, site, &start, view);
             }
             if std::env::var_os("VICTORY_DESC_WHY").is_some() {
                 eprintln!(
@@ -6277,7 +6336,38 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        let view = View {
+            first,
+            props,
+            image,
+            uav,
+            stride: used.map_or(0, |u| u.stride),
+            address: false,
+        };
+        self.descriptor_words(inst, site, &src, view)
+    }
+
+    /// The dwords of descriptor `src`, loaded by `inst` at `site`, that the host
+    /// view `view` names tells (see [`Self::descriptor_data`]); the others are
+    /// missing, an error where the code reads them.
+    fn descriptor_words(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        src: &Source,
+        view: View,
+    ) -> Result<(), Why> {
+        const OTHER: Why = "a descriptor's address or format read as data";
+        let View {
+            first,
+            props,
+            image,
+            uav,
+            stride,
+            address,
+        } = view;
+        let (code, count) = load_dwords(inst).ok_or("a scalar memory read as data")?;
+        let h = self.handle(site, src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -6330,7 +6420,6 @@ impl<'a> Lower<'a> {
             None => {
                 // A raw view counts bytes; the descriptor's record count is in elements.
                 let n = field(self, 0);
-                let stride = used.map_or(0, |u| u.stride);
                 let n = if props.0 & 0xFF == 11 && stride > 1 {
                     let k = self.s.m.i32(stride);
                     self.s.m.bin(c, Bin::UDiv, n, k)
@@ -6338,12 +6427,13 @@ impl<'a> Lower<'a> {
                     n
                 };
                 let mut words = vec![(2, n)];
-                // Its address too, where the code computes with it and the
-                // host can tell it.
-                let computed = (0..2u8).any(|k| {
-                    inst.write(Reg::S(code + first + k))
-                        .is_some_and(|v| self.computed_with(v, 6))
-                });
+                // Its address too, where the code computes with it (or the
+                // view is asked for it) and the host can tell it.
+                let computed = address
+                    || (0..2u8).any(|k| {
+                        inst.write(Reg::S(code + first + k))
+                            .is_some_and(|v| self.computed_with(v, 6))
+                    });
                 if first == 0
                     && computed
                     && let Some((lo, hi)) = self.view_address(site)
