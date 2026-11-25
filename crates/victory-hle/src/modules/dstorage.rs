@@ -1086,10 +1086,12 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
+    let array = request.destination.cast::<usize>();
+    let count = (offset + len).div_ceil(PAGE);
+    let mut pages = filled(array, count);
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
@@ -1105,14 +1107,24 @@ fn into_destination(
             .and_then(|v| v.parse().ok())
             .unwrap_or(12)
     });
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+    let mut written = super::xmem::write_physical(&pages, offset, &data[..n]);
     let mut tries = 0;
+    let mut relisted = false;
     while !written && tries < retries {
         std::thread::sleep(std::time::Duration::from_millis(
             (2u64 << tries.min(6)).min(128),
         ));
         tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
+        // A list that still names page 0 (no page: numbers start at
+        // 0x10_0000) after `filled` gave up waiting is one the title is
+        // still filling. Read it again before each retry, or every retry
+        // writes to the same missing page and the request fails although
+        // the numbers arrived.
+        if pages.contains(&0) {
+            pages = read_pages(array, count);
+            relisted = true;
+        }
+        written = super::xmem::write_physical(&pages, offset, &data[..n]);
     }
     if written {
         if tries > 0 {
@@ -1120,12 +1132,13 @@ fn into_destination(
                 offset,
                 len,
                 tries,
+                relisted,
                 "dstorage: a destination's physical pages written after a retry"
             );
         }
         Ok(())
     } else {
-        let known = super::xmem::pages_known(pages, offset, len);
+        let known = super::xmem::pages_known(&pages, offset, len);
         tracing::warn!(
             known,
             last_error = std::io::Error::last_os_error().raw_os_error(),
@@ -1138,6 +1151,7 @@ fn into_destination(
         tracing::warn!(
             offset,
             len,
+            relisted,
             pages = pages.len(),
             first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
             options = format_args!("{:#x}", request.options),
@@ -1147,28 +1161,32 @@ fn into_destination(
     }
 }
 
+/// The `n` page numbers at `array`, as they stand now. Read volatile
+/// because the title writes the array from another thread while the
+/// request runs, so one reading says nothing about the next.
+fn read_pages(array: *const usize, n: usize) -> Vec<usize> {
+    // SAFETY: the title passes a page number per 64 KiB of destination and
+    // keeps the array until the request completes; it may write it from
+    // another thread meanwhile.
+    (0..n)
+        .map(|i| unsafe { array.add(i).read_volatile() })
+        .collect()
+}
+
 /// The page numbers of a destination. The title fills the array after it
 /// enqueued the request (a copy taken then holds zeros, or the numbers of
 /// the array's last use), so it is read when the request runs; a number
 /// that is still zero then is waited for, a tenth of a second at most.
 fn filled(array: *const usize, n: usize) -> Vec<usize> {
     static LATE: AtomicU64 = AtomicU64::new(0);
-    let read = || -> Vec<usize> {
-        // SAFETY: the title passes a page number per 64 KiB of destination
-        // and keeps the array until the request completes; it may write it
-        // from another thread meanwhile.
-        (0..n)
-            .map(|i| unsafe { array.add(i).read_volatile() })
-            .collect()
-    };
-    let mut pages = read();
+    let mut pages = read_pages(array, n);
     if !pages.contains(&0) {
         return pages;
     }
     let began = std::time::Instant::now();
     while pages.contains(&0) && began.elapsed() < std::time::Duration::from_millis(100) {
         std::thread::sleep(std::time::Duration::from_millis(2));
-        pages = read();
+        pages = read_pages(array, n);
     }
     let late = LATE.fetch_add(1, Ordering::Relaxed) + 1;
     if late <= 8 || late.is_power_of_two() {
@@ -1715,6 +1733,60 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
     }
+    /// The title fills a request's page list after enqueueing it, and a
+    /// queue half full is submitted on its own, so a read can start before
+    /// the list holds anything. Here the numbers arrive after `filled` has
+    /// given up waiting, which leaves the retries writing to page 0 (no
+    /// page) unless they read the list again.
+    #[test]
+    fn a_page_list_filled_after_the_retries_began_is_read_again() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
+        assert_eq!(given, 1);
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        // The title's list: still empty when the request is submitted, and
+        // filled later than `filled` waits (a tenth of a second).
+        let list: &'static [std::sync::atomic::AtomicUsize] =
+            Box::leak(Box::new([std::sync::atomic::AtomicUsize::new(0)]));
+        let number = page[0];
+        let title = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            list[0].store(number, Ordering::Release);
+        });
+
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_ptr().cast_mut().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        title.join().unwrap();
+        // SAFETY: the page is mapped read-write for `PAGE` bytes.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
+    }
+
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;
