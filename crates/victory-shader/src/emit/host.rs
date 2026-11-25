@@ -87,8 +87,10 @@ impl Host {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
-            // refused pipeline's error then carries.
-            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+            // refused pipeline's error then carries. `0` is off, as the GPU
+            // crate reads the same switch (`victory_gpu::switch`); this crate
+            // does not depend on that one, so the rule is written out here.
+            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some_and(|v| v != "0") {
                 let mut debug: Option<ID3D12Debug> = None;
                 if D3D12GetDebugInterface(&mut debug).is_ok()
                     && let Some(debug) = debug
