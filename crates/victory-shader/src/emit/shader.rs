@@ -76,6 +76,12 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// parts, each with the groups before it here. Asked for by compute programs
 /// that are told the x number alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host sets: the actual X
+/// thread count of a one-dimensional dispatch whose last group may be short
+/// (the console's `DispatchX` given threads). Zero keeps every thread of
+/// every group. The metadata's `dword` holds the group's X width. (0x105 is
+/// upstream's `USER_VIEW_RECORDS`, kept free.)
+pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

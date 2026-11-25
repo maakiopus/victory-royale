@@ -1384,7 +1384,7 @@ mod tests {
             3,
             "a draw, an indexed draw and a mesh dispatch, all dropped"
         );
-        state.dispatch(&list, 1, 1, 1);
+        state.dispatch(&list, 1, 1, 1, None);
         assert_eq!(
             crate::draw::attempted() - before,
             3,

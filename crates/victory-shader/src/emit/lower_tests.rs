@@ -1,4 +1,6 @@
-use super::lower::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+use super::lower::{
+    Lowered, Numeric, Parts, buffer_format, half_shift, lower, lower_with_thread_limit,
+};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -623,4 +625,72 @@ fn small_floats_widen_as_halves() {
     assert!(f10(0x3FF).is_nan());
     // A 16-bit float is a half already, sign included.
     assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+}
+
+/// A wave64 program of one 64-thread group that adds through a UAV,
+/// lowered with or without the X thread limit.
+fn lower_group_of_64(partial: bool) -> Lowered {
+    let words = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0xE0C8_1000,
+        0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![root(RootType::Constants, 0, 0), root(RootType::Table, 4, 1)],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [64, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, true, 16).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let parts = Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    };
+    lower_with_thread_limit(&parts, partial).expect("lower")
+}
+
+#[test]
+fn a_thread_limited_group_asks_the_host_for_its_x_thread_count() {
+    let kind = RootType::Other(super::USER_DISPATCH_THREADS_X);
+    let limited = lower_group_of_64(true);
+    let words: Vec<_> = limited
+        .user_data
+        .iter()
+        .filter(|u| u.root == kind)
+        .collect();
+    assert_eq!(words.len(), 1, "{:?}", limited.user_data);
+    // The group's X width rides in `dword` for the host (`draw.rs`).
+    assert_eq!((words[0].slot, words[0].dword), (0, 64));
+    let full = lower_group_of_64(false);
+    assert!(full.user_data.iter().all(|u| u.root != kind));
 }

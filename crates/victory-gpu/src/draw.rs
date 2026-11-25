@@ -239,9 +239,8 @@ pub(crate) struct State {
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
-    /// address; 0 for none) → dynamic slot, and the host copy the slot
-    /// shows: later draws of the list bring that one up to date, whatever
-    /// copy the address would find by then (`shadow.rs` `tails`).
+    /// address; 0 for none) → current buffer owner and its dynamic slot.
+    /// Earlier bindings keep their own slots until this list finishes.
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
@@ -365,8 +364,32 @@ pub(crate) fn take_frame() -> Vec<String> {
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
-/// A root SRV's dynamic slot in a list, and the host copy it shows.
-type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
+/// A root view's dynamic slot in a list, and the host copy it shows.
+#[derive(Default)]
+struct RootSlot {
+    generation: u64,
+    index: Option<u32>,
+    shadow: Option<std::sync::Arc<crate::shadow::Shadow>>,
+}
+
+impl RootSlot {
+    /// A title can replace the buffer behind an unchanged root address while
+    /// recording a list (the ray-tracing structure builder reuses scratch
+    /// addresses). Only take another descriptor if the owner changed: the
+    /// one recorded earlier still serves the earlier dispatches.
+    fn resolve(&mut self, find: impl FnOnce() -> Option<std::sync::Arc<crate::shadow::Shadow>>) {
+        let generation = crate::shadow::buffer_generation();
+        if self.index.is_some() && self.generation == generation {
+            return;
+        }
+        let current = find();
+        if self.shadow.as_ref().map(|s| s.id()) != current.as_ref().map(|s| s.id()) {
+            self.index = None;
+        }
+        self.shadow = current;
+        self.generation = generation;
+    }
+}
 
 /// Takes `more` from the time a run may spend bringing in a long queue of
 /// textures at more than the usual pace; whether some is left.
@@ -802,8 +825,9 @@ impl State {
         use victory_shader::emit::{
             USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
         };
-        // Set between the parts of a large dispatch (`group_base`).
-        if kind == USER_GROUP_BASE {
+        // Set between the parts of a large dispatch (`group_base`); the
+        // thread count only by a dispatch given threads (`dispatch`).
+        if kind == USER_GROUP_BASE || kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
         if kind == USER_MEMORY_BASE {
@@ -1284,13 +1308,16 @@ impl State {
             return false;
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
-        let (index, shadow) = match self.root_uav_slots.get(&key) {
-            Some((index, shadow)) => (*index, address.zip(shadow.clone())),
+        let slot = self.root_uav_slots.entry(key).or_default();
+        slot.resolve(|| address.and_then(find));
+        let shadow = address.zip(slot.shadow.clone());
+        let index = match slot.index {
+            Some(index) => index,
             None => {
-                let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
+                slot.index = Some(index);
                 self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
@@ -1312,9 +1339,7 @@ impl State {
                 if shadow.is_none() {
                     host.null_raw_uav_at(index);
                 }
-                self.root_uav_slots
-                    .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
-                (index, shadow)
+                index
             }
         };
         if let Some((a, s)) = &shadow {
@@ -1336,7 +1361,7 @@ impl State {
     /// ([`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
     /// title buffer's host copy from `address` to the copy's end, or a null
     /// view (no address, no host copy, or an address not on 16 bytes). One
-    /// dynamic slot per address per list, given back with the list's
+    /// dynamic slot per buffer owner and address, given back with the list's
     /// others. False if no slot could be had or no view heap is bound.
     fn root_srv_table(
         &mut self,
@@ -1360,16 +1385,17 @@ impl State {
             std::ptr::from_ref(heap) as usize,
             address.unwrap_or(0) | u64::from(biased) << 63,
         );
-        let (index, shadow) = match self.root_srv_slots.get(&key) {
-            Some((index, shadow)) => (*index, address.zip(shadow.clone())),
+        let slot = self.root_srv_slots.entry(key).or_default();
+        slot.resolve(|| address.and_then(|a| crate::shadow::find(a, 1)));
+        let shadow = address.zip(slot.shadow.clone());
+        let index = match slot.index {
+            Some(index) => index,
             None => {
-                let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
+                slot.index = Some(index);
                 self.dynamic.push((key.0, index, 1));
-                self.root_srv_slots
-                    .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
                     Some((a, s)) => {
                         // SAFETY: a live buffer.
@@ -1394,7 +1420,7 @@ impl State {
                     }
                     None => host.null_raw_at(index),
                 }
-                (index, shadow)
+                index
             }
         };
         // As for root descriptors (`root_view`): all that is left of the
@@ -2143,7 +2169,8 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    /// `flags`: those of the console's `DispatchX`, if it came that way.
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: Option<u32>) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -2192,6 +2219,29 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        // The structure builder's `DispatchX` with 0x20 gives threads, not
+        // groups (its box rehydration, header and geometry reload passes):
+        // as many groups as hold them, the last one maybe short.
+        let threads = [x, y, z];
+        let size = flags
+            .filter(|f| f & DISPATCH_THREADS != 0)
+            .filter(|_| crate::pipeline::is_builder(self.pipeline as This))
+            .and_then(|_| p.stages[0].translated().compute_threads);
+        let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        // Where the program takes the thread count, its last group's threads
+        // past it stay idle. A dispatch in parts starts host group IDs at
+        // zero again: each part gets the threads left from its first group.
+        let tail = size.and_then(|size| {
+            compute_word(p, victory_shader::emit::USER_DISPATCH_THREADS_X)
+                .map(|(param, word)| (param, word, size[0]))
+        });
+        let set_tail = |base: u32| {
+            if let Some((param, word, width)) = tail {
+                let left = threads_left(threads[0], base, width);
+                // SAFETY: an open list; the pipeline declares this word.
+                unsafe { list.list.SetComputeRoot32BitConstant(param, left, word) };
+            }
+        };
         match group_base(p) {
             Some((param, dword)) if x > crate::indirect::PART => {
                 // More than the host runs in one dimension: in parts.
@@ -2200,16 +2250,25 @@ impl State {
                 unsafe {
                     let mut base = 0;
                     while base < x {
+                        set_tail(base);
                         list.list.SetComputeRoot32BitConstant(param, base, dword);
-                        list.list
-                            .Dispatch((x - base).min(crate::indirect::PART), y, z);
-                        base += crate::indirect::PART;
+                        let count = (x - base).min(crate::indirect::PART);
+                        list.list.Dispatch(count, y, z);
+                        base += count;
                     }
                     list.list.SetComputeRoot32BitConstant(param, 0, dword);
                 }
             }
-            // SAFETY: an open list with everything set.
-            _ => unsafe { list.list.Dispatch(x, y, z) },
+            _ => {
+                set_tail(0);
+                // SAFETY: an open list with everything set.
+                unsafe { list.list.Dispatch(x, y, z) };
+            }
+        }
+        if let Some((param, word, _)) = tail {
+            // Later dispatches (indirect ones too) run every thread.
+            // SAFETY: an open list; the pipeline declares this word.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::dump_after(list, self.pipeline as This, &[]);
@@ -3427,16 +3486,36 @@ impl State {
 /// group (`victory_shader::emit::USER_GROUP_BASE`): the root parameter of
 /// its user data and the dword in it.
 fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    compute_word(p, victory_shader::emit::USER_GROUP_BASE)
+}
+
+/// A compute pipeline's user-data word of `kind` (`RootType::Other`): the
+/// root parameter of its user data and the dword in it.
+fn compute_word(p: &crate::pipeline::host::HostPipeline, kind: u32) -> Option<(u32, u32)> {
     let stage = p.stages.first().filter(|_| p.compute)?;
     let (param, _) = stage.user_data?;
-    let base = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+    let root = RootType::Other(kind);
     let word = stage
         .translated()
         .host
         .user_data
         .iter()
-        .find(|u| u.root == base)?;
+        .find(|u| u.root == root)?;
     Some((param, word.index))
+}
+
+/// `DispatchX` flag: the counts are threads, not groups.
+const DISPATCH_THREADS: u32 = 0x20;
+
+/// Groups of `size` threads that hold `threads`, per dimension.
+fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
+    std::array::from_fn(|i| threads[i].div_ceil(size[i]))
+}
+
+/// X threads left from group `base` on (groups `width` wide); never zero,
+/// which would let every thread run (`USER_DISPATCH_THREADS_X`).
+fn threads_left(threads: u32, base: u32, width: u32) -> u32 {
+    threads.saturating_sub(base.saturating_mul(width)).max(1)
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -3792,5 +3871,36 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_counts_take_the_groups_that_hold_them() {
+        assert_eq!(dispatch_groups([8847, 1, 1], [64, 1, 1]), [139, 1, 1]);
+        assert_eq!(dispatch_groups([74, 1, 1], [64, 1, 1]), [2, 1, 1]);
+        assert_eq!(dispatch_groups([32, 1, 1], [32, 1, 1]), [1, 1, 1]);
+        assert_eq!(dispatch_groups([0, 12, 9], [64, 4, 4]), [0, 3, 3]);
+        assert_eq!(
+            dispatch_groups([u32::MAX, 1, 1], [64, 1, 1]),
+            [1 << 26, 1, 1]
+        );
+    }
+
+    #[test]
+    fn each_part_of_a_split_dispatch_counts_the_threads_left_from_its_first_group() {
+        assert_eq!(threads_left(74, 0, 64), 74);
+        assert_eq!(threads_left(74, 1, 64), 10);
+        // A part starting past the end still never reads as "all threads".
+        assert_eq!(threads_left(74, 2, 64), 1);
+        assert_eq!(threads_left(u32::MAX, u32::MAX, 64), 1);
+        let threads = 65_535 * 64 + 7;
+        assert_eq!(
+            threads_left(threads, crate::indirect::PART, 64),
+            threads - crate::indirect::PART * 64
+        );
     }
 }

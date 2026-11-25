@@ -124,8 +124,8 @@ pub use rect::rect_list_gs;
 pub use sampler::StaticSampler;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE,
-    USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS_X, USER_GROUP_BASE,
+    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -602,6 +602,18 @@ fn widen(
 }
 
 /// The translated program, and the wave size it requires of the host.
+/// The console structure builder's Box32/Box16 rehydration kernels: one
+/// node header per *active* thread of a 64-thread group, dispatched by
+/// threads (`DispatchX`), so their last group can be short.
+fn box_rehydration(c: &Container, native: &NativeProgram) -> bool {
+    const KERNELS: [u128; 2] = [
+        0xba30_5538_e28d_414c_af39_a51a_4bc2_f308,
+        0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974,
+    ];
+    KERNELS.contains(&u128::from_be_bytes(c.digest))
+        && matches!(&native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1])
+}
+
 fn emit_program(
     c: &Container,
     native: &NativeProgram,
@@ -667,7 +679,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -677,7 +689,8 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    let l = lower::lower_with_thread_limit(&parts, box_rehydration(c, native))?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
