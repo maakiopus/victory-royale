@@ -171,16 +171,14 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 let mut bytes = [0u8; 32];
                 let n = room.min(bytes.len());
                 std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-                if let Some(pass) = clwb_loop(&bytes[..n]) {
+                if let Some(pass) = clwb_loop(&bytes[..n])
+                    && let Some(end) =
+                        clwb_loop_end(*gpr(context, pass.base), *gpr(context, pass.limit))
+                {
                     // A whole write-back loop in one exception (see `clwb_loop`).
                     let limit = *gpr(context, pass.limit);
-                    let base = gpr(context, pass.base);
-                    *base = if *base <= limit {
-                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
-                    } else {
-                        base.wrapping_add(64)
-                    };
-                    let flags = cmp_flags(*base, limit);
+                    *gpr(context, pass.base) = end;
+                    let flags = cmp_flags(end, limit);
                     context.EFlags = context.EFlags & !CMP_FLAGS | flags;
                     context.Rip += pass.len as u64;
                     return true;
@@ -249,6 +247,27 @@ struct ClwbLoop {
     limit: u8,
     /// Bytes from `clwb` to the instruction after `jbe`.
     len: usize,
+}
+
+/// Where a [`ClwbLoop`] leaves `base`, or `None` when running the whole loop
+/// at once would not end: the step past `limit` overflows `u64`, so the last
+/// pass the CPU would take is not the one this arithmetic names.
+///
+/// The title writes back buffers low in its address space, so this is a
+/// guard, not a case seen in a run: a wild `base` or `limit` (a register
+/// holding something else because the bytes only looked like the loop) used
+/// to overflow the multiply, which panics in a debug build and wraps in a
+/// release one, leaving `base` below `limit` and the loop running for ever.
+/// With `None` the single-instruction `clwb` path takes the exception
+/// instead, and the CPU runs the loop's own `add`, `cmp` and `jbe`.
+fn clwb_loop_end(base: u64, limit: u64) -> Option<u64> {
+    let step = if base <= limit {
+        ((limit - base) / 64 + 1).checked_mul(64)?
+    } else {
+        64
+    };
+    let end = base.checked_add(step)?;
+    (end > limit).then_some(end)
 }
 
 fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
@@ -775,6 +794,50 @@ mod tests {
         // The flags the last cmp leaves: base just past limit.
         assert_eq!(cmp_flags(0x1040, 0x1000) & 0x41, 0); // CF and ZF clear: the loop ends
         assert_eq!(cmp_flags(0x1000, 0x1000) & 0x40, 0x40);
+    }
+
+    /// A range whose whole-loop step does not fit in a `u64` is left to the
+    /// single-instruction path, which emulates the `clwb` alone and lets the
+    /// CPU run the loop's `add`, `cmp` and `jbe`.
+    #[test]
+    fn a_write_back_loop_that_would_wrap_is_not_run_at_once() {
+        assert_eq!(clwb_loop_end(0x1000, 0x1080), Some(0x10c0));
+        assert_eq!(clwb_loop_end(0x10c0, 0x1080), Some(0x1100));
+        assert_eq!(clwb_loop_end(0, u64::MAX - 10), None);
+        assert_eq!(clwb_loop_end(u64::MAX - 16, 0x100), None);
+        assert_eq!(clwb_loop_end(u64::MAX - 63, u64::MAX), None);
+
+        // clwb [rcx]; add rcx, 0x40; cmp rcx, rax; jbe top: 13 bytes, of
+        // which `clwb` is 4.
+        let mut bytes = [0xcc_u8; 16];
+        bytes[..13].copy_from_slice(&[
+            0x66, 0x0f, 0xae, 0x31, 0x48, 0x83, 0xc1, 0x40, 0x48, 0x39, 0xc1, 0x76, 0xf3,
+        ]);
+        let run = |base: u64, limit: u64| -> (u64, u64) {
+            let start = bytes.as_ptr() as u64;
+            // SAFETY: a zeroed record and context are valid for both, and
+            // `emulate_amd_only` only reads the code at `Rip` (our own
+            // `bytes`, which outlive the call) and writes the context.
+            unsafe {
+                let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+                record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = start;
+                context.Rcx = base;
+                context.Rax = limit;
+                let mut pointers = EXCEPTION_POINTERS {
+                    ExceptionRecord: &mut record,
+                    ContextRecord: &mut context,
+                };
+                assert!(emulate_amd_only(&mut pointers));
+                (context.Rip - start, context.Rcx)
+            }
+        };
+        // A range the loop can finish: the whole 13 bytes in one exception.
+        assert_eq!(run(0x1000, 0x1080), (13, 0x10c0));
+        // Ranges that would wrap: the 4-byte `clwb` only, `base` untouched.
+        assert_eq!(run(0, u64::MAX - 10), (4, 0));
+        assert_eq!(run(u64::MAX - 16, 0x100), (4, u64::MAX - 16));
     }
 
     #[test]
