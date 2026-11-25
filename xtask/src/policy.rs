@@ -14,7 +14,8 @@ const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh", "py",
+    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "py",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -265,7 +266,8 @@ mod tests {
         assert!(check("tests/metal/run.py", b"import subprocess").is_empty());
         assert!(check("tests/metal/probe.swift", b"import Metal").is_empty());
 
-        assert!(!check("other.py", b"pass").is_empty());
+        assert!(check("other.py", b"pass").is_empty());
+        assert!(!check("other.py", b"MZ\x90\0").is_empty());
         assert!(!check("other.swift", b"import Metal").is_empty());
         assert!(!check("tests/metal/probe.swift", b"MZ\x00").is_empty());
         assert!(!check("tests/metal/run.py", &vec![b'a'; 800]).is_empty());
