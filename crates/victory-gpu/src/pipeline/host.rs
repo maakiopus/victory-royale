@@ -414,6 +414,25 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// RADV crashes on SPIR-V that vkd3d-proton produces for some shaders.
+/// Refusing the pipeline here keeps the title running with that draw
+/// missing, which is more useful than losing the whole process.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skip_requested(shaders: &[Arc<Shader>]) -> bool {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        let hashes =
+            super::parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default());
+        tracing::info!(?hashes, "VICTORY_SKIP_PIPELINES parsed");
+        hashes
+    });
+    let hit = shaders.iter().find(|s| hashes.contains(&s.hash));
+    if let Some(shader) = hit {
+        tracing::info!(hash = %shader.hash, "skipping pipeline before creating it");
+    }
+    hit.is_some()
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -422,6 +441,10 @@ impl HostPipeline {
         g: Option<&GraphicsState>,
         structured_strides: &[(victory_shader::emit::StructuredBinding, u32)],
     ) -> Option<HostPipeline> {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if skip_requested(shaders) {
+            return refuse("skipped by VICTORY_SKIP_PIPELINES", shaders);
+        }
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
