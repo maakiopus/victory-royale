@@ -1726,6 +1726,11 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_half(words, input_addr, false)
+    }
+
+    /// [`pixel`] whose attribute carries 16-bit values when `half`.
+    fn pixel_half(words: &[u32], input_addr: u32, half: bool) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1739,7 +1744,7 @@ mod barycentric_tests {
                     mask: 0b1111,
                     attr: 0,
                     flat: false,
-                    fp16: false,
+                    fp16: half,
                     pack2: false,
                     row2: 0,
                 }],
@@ -1751,7 +1756,9 @@ mod barycentric_tests {
         };
         let mut target = element("SV_Target", 16, 0);
         target.usage = 15;
-        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+        let mut coord = element("TEXCOORD", 0, 0);
+        coord.half = half;
+        let isg1 = container::signature(&[coord], true);
         let osg1 = container::signature(&[target], false);
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
@@ -1780,6 +1787,41 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    /// `v_interp_p2_f16` is a VOP3 instruction with a 16-bit destination,
+    /// so op_sel[3] picks the half it writes and omod and clamp apply to
+    /// its result. The lowering wrote the low half and dropped both
+    /// modifiers, so all four forms translated to the same module.
+    #[test]
+    fn interpolated_f16_honors_op_sel_omod_and_clamp() {
+        let [e0, e1] = exp_mrt0(2);
+        // v_interp_p1ll_f16 v2, v0, attr0.x; then the second half from v1
+        // completing v2, with op_sel[3] (word 0 bit 14), clamp (bit 15) and
+        // omod (word 1 bits 28-27).
+        let module = |opsel: u32, omod: u32, clamp: u32| {
+            let words = [
+                0xD742_0002u32,
+                0x0002_0000,
+                0xD75A_0002 | opsel << 14 | clamp << 15,
+                0x040A_0200 | omod << 27,
+                e0,
+                e1,
+                0xBF81_0000,
+            ];
+            pixel_half(&words, PERSP_CENTER, true)
+                .unwrap_or_else(|e| panic!("op_sel {opsel}, omod {omod}, clamp {clamp}: {e}"))
+                .dxil
+        };
+        let plain = module(0, 0, 0);
+        assert_eq!(plain, module(0, 0, 0), "translating twice differed");
+        for (opsel, omod, clamp) in [(1, 0, 0), (0, 1, 0), (0, 2, 0), (0, 3, 0), (0, 0, 1)] {
+            assert_ne!(
+                plain,
+                module(opsel, omod, clamp),
+                "op_sel {opsel}, omod {omod}, clamp {clamp} changed nothing"
+            );
+        }
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as

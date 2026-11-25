@@ -9620,9 +9620,12 @@ impl<'a> Lower<'a> {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     self.as_int(f)
                 } else if f16 {
+                    // A 16-bit result like any other VOP3 one: omod and
+                    // clamp are the instruction's, and op_sel[3] (or SDWA)
+                    // picks the destination half.
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
-                    let lo = to_f16(self, f);
-                    self.low_half(inst, reg, lo)
+                    let r = self.f16_result(inst, f)?;
+                    return self.write_half(inst, r, None);
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
                     let h = 2 * attribute.channel;
@@ -9744,6 +9747,34 @@ impl<'a> Lower<'a> {
 
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
     /// results keep the register's high half (GFX10).
+    /// The half an f32 result becomes, with the instruction's VOP3 output
+    /// modifiers: omod, then clamp, applied in f32 so the conversion to a
+    /// half rounds once, as the f16 operations in [`Self::valu16`] do.
+    fn f16_result(&mut self, inst: &Inst, f: V) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            return Err("a 16-bit float result outside a VALU instruction");
+        };
+        let (omod, clamp) = (v.omod, v.clamp);
+        let mut f = f;
+        if omod != 0 {
+            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(omod)];
+            let k = self.s.m.f32(factor.to_bits());
+            f = self.s.m.bin(self.cur, Bin::Mul, f, k);
+        }
+        if clamp {
+            f = self.unary(7, f);
+        }
+        // The console rounds to nearest, the host's conversion need not:
+        // the same shortcut the f16 operations take.
+        if f16_nearest_on() {
+            return Ok(self.f16_nearest(f));
+        }
+        let i32t = self.s.t.i32;
+        Ok(self
+            .s
+            .op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]))
+    }
+
     fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
         let c = self.cur;
         let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
