@@ -1262,16 +1262,31 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }
         let found = found.clone();
         jobs.push(Box::new(move || {
-            let mut mine: Found = Vec::with_capacity(group.len());
+            let mut mine: Found = Vec::new();
             for (data, before, start, from, to, which, place) in group {
+                // A job holds whole 64 KiB pieces, so comparing its whole
+                // span first is the same test as comparing each piece:
+                // equal means none differ, unequal means walk the pieces
+                // to say which. Almost every job is equal (the world
+                // compares about 1.4 GB a frame and shaders write a few
+                // MB), so this turns 16 piece comparisons and a shared
+                // lock acquisition per job into one comparison and none.
+                // SAFETY: inside the copy's mapping and its snapshot
+                // (which holds the copy's bytes at the copy's offsets);
+                // nothing writes either while a submission's results
+                // are compared.
+                let equal = unsafe {
+                    std::slice::from_raw_parts((data + from) as *const u8, to - from)
+                        == std::slice::from_raw_parts((before + from) as *const u8, to - from)
+                };
+                if equal {
+                    continue;
+                }
                 let mut pieces = Vec::new();
                 let mut at = from;
                 while at < to {
                     let n = (PIECE - (start + at) % PIECE).min(to - at);
-                    // SAFETY: inside the copy's mapping and its snapshot
-                    // (which holds the copy's bytes at the copy's offsets);
-                    // nothing writes either while a submission's results
-                    // are compared.
+                    // SAFETY: a part of the job's two ranges above.
                     let (now, old) = unsafe {
                         (
                             std::slice::from_raw_parts((data + at) as *const u8, n),
@@ -1283,9 +1298,13 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     }
                     at += n;
                 }
-                mine.push((which, place, pieces));
+                if !pieces.is_empty() {
+                    mine.push((which, place, pieces));
+                }
             }
-            found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
+            if !mine.is_empty() {
+                found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
+            }
         }));
     };
     let count = scans.len();
@@ -1467,6 +1486,46 @@ mod wide_tests {
         // A scan of nothing (a range whose snapshot is gone).
         scans.push((0, 0, 0, 0, 0));
         wanted.push(Vec::new());
+        assert_eq!(find_pieces(scans), wanted);
+    }
+
+    /// The whole-job compare skips only jobs with no differing piece:
+    /// equal jobs contribute nothing, and a differing job yields exactly
+    /// the pieces a byte-by-byte walk finds, in scan and job order.
+    #[test]
+    fn whole_job_compare_finds_the_same_pieces() {
+        let len = 4 * WIDE_JOB;
+        let old: Vec<u8> = (0..len).map(|i| (i * 11 + i / 97) as u8).collect();
+        // One job untouched, one with a byte at its first piece, one with
+        // a byte at its last piece, one untouched again.
+        let mut now = old.clone();
+        for at in [WIDE_JOB, 2 * WIDE_JOB + PIECE / 2, 3 * WIDE_JOB - 1] {
+            now[at] ^= 0x37;
+        }
+        let (data, before) = (now.as_ptr() as usize, old.as_ptr() as usize);
+        let mut wanted = Vec::new();
+        let mut at = 0;
+        while at < len {
+            let n = PIECE.min(len - at);
+            if now[at..at + n] != old[at..at + n] {
+                wanted.push((at, n));
+            }
+            at += n;
+        }
+        let scans = vec![
+            (0, 0, 0, 0, 0),
+            (data, before, 0, 0, 0),
+            (data, before, 0, WIDE_JOB, 2 * WIDE_JOB),
+            (data, before, 0, 2 * WIDE_JOB, 3 * WIDE_JOB),
+            (data, before, 0, 0, 4 * WIDE_JOB),
+        ];
+        let wanted: Vec<Vec<(usize, usize)>> = vec![
+            Vec::new(),
+            Vec::new(),
+            vec![(WIDE_JOB, PIECE)],
+            vec![(2 * WIDE_JOB, PIECE), (3 * WIDE_JOB - PIECE, PIECE)],
+            wanted,
+        ];
         assert_eq!(find_pieces(scans), wanted);
     }
 }
