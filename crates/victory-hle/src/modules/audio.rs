@@ -521,7 +521,12 @@ fn pump(context: Context, voice: &mut Voice) {
         if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
             return;
         }
-        let write = context.field(0, 27, 5);
+        // The write block is the title's value, so take it modulo the ring
+        // before the first write of a pass, as the read block is taken and
+        // as `advance_read` does. One at or past the ring size would
+        // otherwise be written past the ring's end, into whatever APU
+        // allocation follows it, and only wrap on the next block.
+        let write = context.field(0, 27, 5) % size;
         let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
         let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
             return;
@@ -1002,6 +1007,79 @@ mod tests {
             }
         }
         data
+    }
+
+    /// A write block past the end of the ring (6 on a ring of four) is
+    /// block 2 of it, so blocks 2 and 3 are filled and the ring is then
+    /// full (the read block is 0). Block 6 used to be written first, past
+    /// the ring's end and into whatever the title put there.
+    #[test]
+    fn an_xma_write_block_past_the_ring_end_wraps_before_the_first_write() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
+
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        // Twice the ring, so a write past its end lands in the allocation
+        // and this test sees it instead of being refused by `heap_bytes`.
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x800, 0x100, 2),
+            S_OK
+        );
+        // SAFETY: the allocation was just made: the ring of four blocks and
+        // the area after it, which the pass must not touch.
+        unsafe { output.cast::<u8>().write_bytes(0x55, 0x800) };
+
+        // As in the test below, but with the write block at 6: two packets,
+        // input 0 valid, a ring of four blocks, writable, 48 kHz mono.
+        context.set(0, 2 | 1 << 20 | 4 << 22 | 6 << 27);
+        context.set(1, 1 << 31 | 3 << 27);
+        context.set(2, 32);
+        context.set(5, input_apu);
+        context.set(7, output_apu);
+
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 0x1000, 0x1000), S_OK);
+        let submit = |command: u32, words: &[u32]| {
+            assert_eq!(
+                (m.submit)(acp, command, 0xf1, u32::MAX, words.as_ptr().cast(), 0),
+                S_OK
+            );
+        };
+        submit(ENABLE_XMA, &[1]);
+        xma().pump();
+        let (write, writable) = (context.field(0, 27, 5), context.field(1, 31, 1));
+        // SAFETY: the whole allocation, ring and the area after it.
+        let seen = unsafe { std::slice::from_raw_parts(output.cast::<u8>(), 0x800) }.to_vec();
+
+        submit(DISABLE_XMA, &[1]);
+        (m.release)(acp);
+        ApuFree(input);
+        ApuFree(output);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+
+        // Wrapped onto the read block (0), so the ring is full.
+        assert_eq!((write, writable), (0, 0));
+        let block = |n: usize| &seen[n * 0x100..(n + 1) * 0x100];
+        assert!(
+            seen[0x400..].iter().all(|&b| b == 0x55),
+            "written past the ring"
+        );
+        assert!([2, 3].iter().all(|&n| block(n).iter().all(|&b| b == 0)));
+        assert!([0, 1].iter().all(|&n| block(n).iter().all(|&b| b == 0x55)));
     }
 
     #[test]
