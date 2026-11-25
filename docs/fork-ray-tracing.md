@@ -67,6 +67,20 @@ shaders and emulates the one instruction.
   of its pipelines are refused by the host (they still ask for 64-lane waves on
   a 32-lane GPU) or do not translate.
 - Five shadow-mask trace programs do not translate yet.
+- Under Proton Experimental (vkd3d-proton 2576c0b4, dxil-spirv 114e664e),
+  three trace programs that do translate never get a host pipeline:
+  `559d9f0184e15fe3`, `a1b20bc47e3c9597`, `e8c962358d862e3f` (each tests
+  boxes and triangles with `image_bvh_intersect_ray` and writes its result
+  with `image_store`). That dxil-spirv crashes on their DXIL. The stack
+  overflows in a loop between `CFGNode::find_common_dominator` and
+  `recompute_immediate_dominator` (`node.cpp:389`/`628`). Under Wine the
+  pipeline worker never returns ("a host pipeline worker has not
+  returned"). Their dispatches are dropped every frame, so what they would
+  light stays black. dxil-spirv b540c8a2 converts all three in under 40 ms,
+  and RADV (RX 6700 XT) compiles the SPIR-V in under 0.4 s. The trace
+  program `17829ac71aab4e8d` converts with both versions. Not fixed yet:
+  the fix is either a newer vkd3d-proton or emitted control flow that
+  dxil-spirv 114e664e accepts.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
