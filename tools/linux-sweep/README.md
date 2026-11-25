@@ -18,6 +18,11 @@ SWEEP_LABEL=baseline ./tools/linux-sweep/run.sh
 Overrides: `SWEEP_EXE`, `SWEEP_GAME`, `SWEEP_DURATION`, `SWEEP_KEYS`,
 `PROTONPATH`, `STEAM_COMPAT_INSTALL_PATH`, `STEAM_COMPAT_LIBRARY_PATHS`.
 
+The default `SWEEP_KEYS` presses A (Enter on the keyboard-to-pad table) every
+10 seconds from 10 s to 200 s. The retail game needs an A press after start
+before it leaves the title screen and begins loading; two presses were not
+enough to make that transition deterministic.
+
 Output goes to `/tmp/opencode/sweep-$SWEEP_LABEL/`: `app.log` (app output),
 `runner.log` (umu output), `capture/` (PNG captures), and a structured verdict
 from `analyze.py`.

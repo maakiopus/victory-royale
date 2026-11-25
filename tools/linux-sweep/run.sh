@@ -13,7 +13,7 @@ EXE=${SWEEP_EXE:-$ROOT/target/x86_64-pc-windows-msvc/diag/victory.exe}
 GAME=${SWEEP_GAME:-W:\\hdd\\GTA6.Xbox.v1.0.2.1-CYBERLEEK\\game_scarlett_master.exe}
 PROTON=${PROTONPATH:-$HOME/.local/share/Steam/steamapps/common/Proton - Experimental}
 DURATION=${SWEEP_DURATION:-660}
-KEYS=${SWEEP_KEYS:-20:Enter,70:Enter}
+KEYS=${SWEEP_KEYS:-10:Enter,20:Enter,30:Enter,40:Enter,50:Enter,60:Enter,70:Enter,80:Enter,90:Enter,100:Enter,110:Enter,120:Enter,130:Enter,140:Enter,150:Enter,160:Enter,170:Enter,180:Enter,190:Enter,200:Enter}
 LOG_FILTER=${SWEEP_LOG:-victory_gpu::frame=debug,info}
 
 mkdir -p "$WORK"
