@@ -220,7 +220,8 @@ mod dialog {
         lparam: LPARAM,
     ) -> isize {
         // SAFETY: our dialog; its user data is the `Entry` from `ask`,
-        // stored at WM_INITDIALOG.
+        // stored at WM_INITDIALOG, and the command arm below reads it only
+        // once it is there.
         unsafe {
             let edit = wm::GetDlgItem(dialog, EDIT);
             match message {
@@ -233,8 +234,16 @@ mod dialog {
                     0 // focus set here
                 }
                 wm::WM_COMMAND => {
-                    let entry =
-                        &mut *(wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA) as *mut Entry);
+                    // The system sends commands before WM_INITDIALOG (the
+                    // dialog manager's own, and a control's as it is
+                    // created), when the user data is still 0: there is no
+                    // `Entry` to write the typed text into yet, and reading
+                    // one from a null pointer would end the process.
+                    let user_data = wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA);
+                    if user_data == 0 {
+                        return 0;
+                    }
+                    let entry = &mut *(user_data as *mut Entry);
                     match (wparam & 0xffff) as i32 {
                         wm::IDOK => {
                             let mut buffer =
@@ -254,6 +263,31 @@ mod dialog {
                 }
                 _ => 0,
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A command with no dialog behind it: the user data reads as 0, as
+        /// it does before WM_INITDIALOG. Without the guard the procedure
+        /// writes through a null pointer and ends the process.
+        #[test]
+        fn a_command_before_the_dialog_is_set_up_is_ignored() {
+            assert_eq!(
+                procedure(std::ptr::null_mut(), wm::WM_COMMAND, wm::IDOK as WPARAM, 0),
+                0
+            );
+            assert_eq!(
+                procedure(
+                    std::ptr::null_mut(),
+                    wm::WM_COMMAND,
+                    wm::IDCANCEL as WPARAM,
+                    0
+                ),
+                0
+            );
         }
     }
 }
