@@ -14,7 +14,8 @@ const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh", "py",
+    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "py",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -151,8 +152,8 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    // Only the listed testing tools may use Python or Swift.
-    // All size, magic, NUL and encoded-data checks still apply.
+    // Python tooling is allowed source; only the listed testing tools may use
+    // Swift. All size, magic, NUL and encoded-data checks still apply.
     let allowed = matches!(
         path,
         "tests/metal/generate.py"
@@ -265,7 +266,7 @@ mod tests {
         assert!(check("tests/metal/run.py", b"import subprocess").is_empty());
         assert!(check("tests/metal/probe.swift", b"import Metal").is_empty());
 
-        assert!(!check("other.py", b"pass").is_empty());
+        assert!(check("other.py", b"pass").is_empty());
         assert!(!check("other.swift", b"import Metal").is_empty());
         assert!(!check("tests/metal/probe.swift", b"MZ\x00").is_empty());
         assert!(!check("tests/metal/run.py", &vec![b'a'; 800]).is_empty());

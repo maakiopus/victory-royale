@@ -163,7 +163,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
 
 /// Lowers a compute program with the root parameters `layout` (in user
 /// SGPRs from s0 on) and the used resources `used`.
-fn lower_with(
+pub(super) fn lower_with(
     words: &[u32],
     layout: Vec<RootParam>,
     used: Vec<UsedResource>,
@@ -211,7 +211,7 @@ fn lower_wave(
 }
 
 /// Root parameter `slot` in user SGPRs from `user_data` on.
-fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
+pub(super) fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
     RootParam {
         root,
         table_offset_dwords: 0,
@@ -406,7 +406,7 @@ fn a_descriptor_selected_by_scc_picks_its_heap_index() {
 }
 
 /// Tables of 2D textures at s0 and samplers at s1.
-fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
+pub(super) fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
     let range = |kind, user_data, slot| UsedResource {
         kind,
         root: RootType::Table,
