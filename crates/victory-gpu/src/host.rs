@@ -818,7 +818,7 @@ mod tests {
     fn the_caption_ends_with_how_long_the_process_has_run() {
         use super::{Duration, caption};
 
-        let figures = "ZSlayerHQ retail game | 1 fps 953.5 ms/frame | 1526 draws/frame";
+        let figures = "VictoryRoyale retail game | 1 fps 953.5 ms/frame | 1526 draws/frame";
         let up = |secs| caption(figures, Duration::from_secs(secs));
         assert_eq!(up(0), format!("{figures} | up 0:00"));
         assert_eq!(up(59), format!("{figures} | up 0:59"));
@@ -6861,7 +6861,7 @@ impl Meter {
         }
         let (cpu_pct, gpu_pct, ram_mb) = (self.cpu_pct, self.gpu_pct, self.ram_mb);
         let text = format!(
-            "ZSlayerHQ retail game | {fps:.0} fps {ms:.1} ms/frame | gpu {gpu_pct:.0}% busy \
+            "VictoryRoyale retail game | {fps:.0} fps {ms:.1} ms/frame | gpu {gpu_pct:.0}% busy \
              cpu {cpu_pct:.0}% ram {ram_mb:.0} MB | {draws:.0} draws/frame"
         );
         // Setting the text waits for the window's thread (a title thread,
