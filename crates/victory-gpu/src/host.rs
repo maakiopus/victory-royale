@@ -768,6 +768,21 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Each list prepares the numbered copies it has not yet read since
+    /// its last title copy, whichever list numbered them; writes likewise.
+    #[test]
+    fn raw_memory_reads_follow_each_list_and_guest_copies() {
+        let mut first = super::Deferred::default();
+        let mut second = super::Deferred::default();
+        assert_eq!(first.raw_copies.advance(2, false), (0..2, 2..2));
+        assert_eq!(second.raw_copies.advance(5, true), (0..5, 0..5));
+        assert_eq!(first.raw_copies.advance(5, true), (2..5, 0..5));
+        assert_eq!(first.raw_copies.advance(5, true), (5..5, 5..5));
+        first.invalidate_refreshes();
+        assert_eq!(first.raw_copies.advance(5, false), (0..5, 5..5));
+        assert_eq!(first.raw_copies.advance(6, true), (5..6, 5..6));
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -919,6 +934,111 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// A transition of a prelude (texture, from, to): resolved on the queue
+/// thread in submission order, and holding its texture while a worker may
+/// record it.
+struct PreludeTransition(ID3D12Resource, u32, u32);
+
+fn record_transitions(list: &ID3D12GraphicsCommandList, transitions: &[PreludeTransition]) {
+    if transitions.is_empty() {
+        return;
+    }
+    let barriers: Vec<_> = transitions
+        .iter()
+        .map(|PreludeTransition(texture, from, to)| {
+            transition(
+                texture,
+                D3D12_RESOURCE_STATES(*from as i32),
+                D3D12_RESOURCE_STATES(*to as i32),
+            )
+        })
+        .collect();
+    // SAFETY: the list is open and the transitions hold their textures.
+    unsafe { list.ResourceBarrier(&barriers) };
+}
+
+/// A list's prelude as [`HostList::plan_prelude`] planned it: its commands
+/// are recorded by [`PlannedPrelude::record`], on this thread or a worker.
+struct PlannedPrelude {
+    commands: Prelude,
+    to_copy: Vec<PreludeTransition>,
+    syncs: Vec<(
+        std::sync::Arc<crate::resource::HostTexture>,
+        std::sync::Arc<crate::resource::Twin>,
+        bool,
+    )>,
+    barriers: Vec<PreludeTransition>,
+}
+
+impl PlannedPrelude {
+    fn record(self) {
+        let (allocator, list) = self.commands;
+        // SAFETY: the submission owns this allocator and list: no other
+        // worker records it, and every earlier submission was waited for.
+        let recorded = unsafe {
+            allocator.Reset().and_then(|()| {
+                list.Reset(&allocator, None)?;
+                record_transitions(&list, &self.to_copy);
+                for (depth, twin, colour) in &self.syncs {
+                    record_twin_copy(&list, &depth.texture, twin, *colour);
+                }
+                record_transitions(&list, &self.barriers);
+                list.Close()
+            })
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("a host state prelude did not record ({e})"));
+        }
+    }
+}
+
+/// Records the planned preludes, on the CPU workers when there are enough
+/// of them to repay the dispatch: a few transitions record faster here,
+/// while a depth-twin copy records several commands.
+fn record_preludes(plans: Vec<PlannedPrelude>) {
+    let barrier_count: usize = plans
+        .iter()
+        .map(|p| p.to_copy.len() + p.barriers.len())
+        .sum();
+    let includes_copies = plans.iter().any(|p| !p.syncs.is_empty());
+    if plans.len() < 4 || (barrier_count < 256 && !includes_copies) {
+        plans.into_iter().for_each(PlannedPrelude::record);
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                lists = plans.len(),
+                "recording submission preludes on CPU workers"
+            );
+        });
+    }
+    let jobs = plans
+        .into_iter()
+        .map(|plan| Box::new(move || plan.record()) as Box<dyn FnOnce() + Send>)
+        .collect();
+    crate::shadow::wide_run(jobs);
+}
+
+/// Whether a submission's preludes are recorded on CPU workers
+/// (`VICTORY_PARALLEL_PRELUDES=1`; off by default): only for four or more
+/// distinct lists, since a list owns one prelude allocator, which two
+/// workers must not reset. The card gets the lists in submission order.
+fn parallel_preludes(runs: &[&HostList]) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if runs.len() < 4
+        || !*ON
+            .get_or_init(|| std::env::var_os("VICTORY_PARALLEL_PRELUDES").is_some_and(|v| v == "1"))
+    {
+        return false;
+    }
+    let mut unique = std::collections::HashSet::with_capacity(runs.len());
+    runs.iter()
+        .all(|list| unique.insert(std::ptr::from_ref(*list)))
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -1781,7 +1901,10 @@ enum Step {
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
     /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    Fill(Fill),
+    /// A run of fills, which CPU workers may share
+    /// ([`fill_workers`]).
+    Fills(Vec<Fill>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -1804,6 +1927,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// The first of the fills that end `copies` without a break.
+    fill_start: usize,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -1816,6 +1941,9 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// The numbered copies of title memory (`crate::memory`) the list
+    /// already brings up to date and copies back.
+    raw_copies: RawCopyCoverage,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1833,7 +1961,44 @@ struct Deferred {
     after: Vec<Box<dyn Fn() + Send>>,
 }
 
+/// How many of the numbered copies of title memory (`crate::memory`) a
+/// list brings up to date (`read`) and copies back (`written`) when it is
+/// submitted: the first that many.
+#[derive(Default)]
+struct RawCopyCoverage {
+    read: usize,
+    written: usize,
+}
+
+impl RawCopyCoverage {
+    /// With `count` copies numbered and a shader that writes or not: the
+    /// copies still to bring up to date, and those still to copy back.
+    fn advance(
+        &mut self,
+        count: usize,
+        writes: bool,
+    ) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let reads = self.read.min(count)..count;
+        self.read = count;
+        let new_writes = if writes {
+            let from = self.written.min(count);
+            self.written = count;
+            from..count
+        } else {
+            count..count
+        };
+        (reads, new_writes)
+    }
+}
+
 impl Deferred {
+    /// A step that may write title memory: what was brought up to date
+    /// before it is brought up to date again after it.
+    fn invalidate_refreshes(&mut self) {
+        self.refreshed.clear();
+        self.raw_copies.read = 0;
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -2311,8 +2476,12 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
+                Step::Fill(_) | Step::Fills(_) => {
+                    if step
+                        .fills()
+                        .iter()
+                        .any(|f| touches(written, f.src, f.src.saturating_add(f.len)))
+                    {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2872,6 +3041,12 @@ fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
 }
+
+/// Since the last frame-rate line: runs of fills shared by CPU workers, and
+/// the fills in them ([`fill_workers`]).
+#[cfg(feature = "diagnostics")]
+static FILL_BATCHES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
 /// that continue the one before ([`join_copies`]).
@@ -4683,14 +4858,24 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        let parallel = parallel_preludes(runs);
+        let mut plans = Vec::new();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
+            if let Some(plan) = list.plan_prelude() {
+                lists.push(plan.commands.1.cast().ok());
+                if parallel {
+                    plans.push(plan);
+                } else {
+                    plan.record();
+                }
             }
             lists.push(list.list.cast().ok());
         }
+        // Only the recording runs on workers: the card gets the lists in
+        // order, once every worker has closed its list.
+        record_preludes(plans);
         batch.flush();
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
@@ -5479,10 +5664,9 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn plan_prelude(&self) -> Option<PlannedPrelude> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
-        let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -5519,17 +5703,9 @@ impl HostList {
                 let real = texture.state.load(Ordering::Relaxed);
                 copying.insert(key, state);
                 if real != state {
-                    to_copy.push(transition(
-                        &texture.texture,
-                        host_state(real),
-                        host_state(state),
-                    ));
+                    to_copy.push(PreludeTransition(texture.texture.clone(), real, state));
                     if !states.contains_key(&key) {
-                        barriers.push(transition(
-                            &texture.texture,
-                            host_state(state),
-                            host_state(real),
-                        ));
+                        barriers.push(PreludeTransition(texture.texture.clone(), state, real));
                     }
                 }
             }
@@ -5537,40 +5713,24 @@ impl HostList {
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
-            (real != *first)
-                .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
+            (real != *first).then(|| PreludeTransition(copy.texture.clone(), real, *first))
         }));
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
+        let Some(commands) = self
             .prelude
             .get_or_init(|| host().and_then(|h| h.make_prelude()))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
-        let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                if !to_copy.is_empty() {
-                    list.ResourceBarrier(&to_copy);
-                }
-                for (depth, twin, colour) in &syncs {
-                    record_twin_copy(list, &depth.texture, twin, *colour);
-                }
-                if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
-                }
-                list.Close()
-            })
-        };
-        if let Err(e) = recorded {
-            fail(format_args!("a host state prelude did not record ({e})"));
-        }
-        list.cast().ok()
+        Some(PlannedPrelude {
+            commands: commands.clone(),
+            to_copy,
+            syncs,
+            barriers,
+        })
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -5683,15 +5843,18 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.invalidate_refreshes();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        let fill = Fill {
+            dst: dst as usize,
+            src: src as usize,
+            len,
+        };
+        self.deferred().append_fill(fill, fill_workers());
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -5886,8 +6049,21 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.invalidate_refreshes();
+    }
+
+    /// Of the `count` numbered copies of title memory (`crate::memory`):
+    /// those this list must still bring up to date, and with `writes`
+    /// those it must still copy back. Lists record in any order, and one
+    /// may be submitted before another that numbered a copy it reads.
+    pub(crate) fn raw_memory_ranges(
+        &self,
+        count: usize,
+        writes: bool,
+    ) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        self.deferred().raw_copies.advance(count, writes)
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -5922,14 +6098,21 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                Step::Fill(_) | Step::Fills(_) => {
+                    let fills = step.fills();
+                    let bytes = fills.iter().map(|f| f.len).sum::<usize>();
+                    let jobs = run_fills(fills, fill_workers());
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        add(C::Copies, fills.len() as u64);
+                        add(C::CopyBytes, bytes as u64);
+                        if jobs > 1 {
+                            FILL_BATCHES[0].fetch_add(1, Ordering::Relaxed);
+                            FILL_BATCHES[1].fetch_add(fills.len() as u64, Ordering::Relaxed);
+                        }
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    let _ = jobs;
+                    bytes
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -5984,6 +6167,242 @@ impl HostList {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+    }
+}
+
+/// How many CPU workers share a run of upload fills at submission
+/// (`VICTORY_FILL_WORKERS`, 1 to 6; 1 by default: on this thread, as
+/// before). DexNom `5f4c3df`: 28,279 small reads took 11.67 ms on four
+/// workers against 17.64 ms on one (a CPU-only benchmark).
+fn fill_workers() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("VICTORY_FILL_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 6)
+    })
+}
+
+/// A copy of `len` bytes of title memory at `src` into upload memory at
+/// `dst`.
+#[derive(Clone, Copy)]
+struct Fill {
+    dst: usize,
+    src: usize,
+    len: usize,
+}
+
+impl Fill {
+    fn run(self) {
+        copy_mapped(self.dst as *mut u8, self.src as *const u8, self.len, false);
+    }
+}
+
+impl Step {
+    /// The fills of a fill step; none for other steps.
+    fn fills(&self) -> &[Fill] {
+        match self {
+            Self::Fill(fill) => std::slice::from_ref(fill),
+            Self::Fills(group) => group,
+            _ => &[],
+        }
+    }
+}
+
+/// The fills a worker takes at least.
+const FILLS_PER_JOB: usize = 128;
+
+impl Deferred {
+    /// Adds a fill. With more than one worker, a run of `2 *
+    /// FILLS_PER_JOB` fills with nothing between them becomes one group
+    /// the workers share; shorter runs stay single steps. Any other step
+    /// ends a run.
+    fn append_fill(&mut self, fill: Fill, workers: usize) {
+        if workers > 1 {
+            match self.copies.last_mut() {
+                Some(Step::Fills(group)) if group.len() < 4096 => {
+                    group.push(fill);
+                    return;
+                }
+                Some(Step::Fill(_)) => {}
+                _ => self.fill_start = self.copies.len(),
+            }
+            if self.copies.len() - self.fill_start + 1 == 2 * FILLS_PER_JOB {
+                let mut group = Vec::with_capacity(2 * FILLS_PER_JOB);
+                group.extend(
+                    self.copies
+                        .drain(self.fill_start..)
+                        .flat_map(|step| step.fills().to_vec()),
+                );
+                group.push(fill);
+                self.copies.push(Step::Fills(group));
+                return;
+            }
+        }
+        self.copies.push(Step::Fill(fill));
+    }
+}
+
+/// Whether workers may run `fills` in any order: their destinations rise
+/// without overlapping (as scratch allocations do), and no source overlaps
+/// the destinations' span.
+fn independent_fills(fills: &[Fill]) -> bool {
+    let Some(first) = fills.first() else {
+        return false;
+    };
+    let mut end = first.dst;
+    for fill in fills {
+        let Some(next) = fill.dst.checked_add(fill.len) else {
+            return false;
+        };
+        if fill.dst < end {
+            return false;
+        }
+        end = next;
+    }
+    fills.iter().all(|f| {
+        f.src
+            .checked_add(f.len)
+            .is_some_and(|src_end| f.src >= end || src_end <= first.dst)
+    })
+}
+
+/// Runs a run of fills, on up to `workers` threads if they are
+/// independent; returns how many ran them. The workers are done before
+/// the next step reads title memory, lets go of upload memory or sends
+/// the list to the card.
+fn run_fills(fills: &[Fill], workers: usize) -> usize {
+    let jobs = workers.min(fills.len() / FILLS_PER_JOB);
+    if jobs <= 1 || !independent_fills(fills) {
+        fills.iter().copied().for_each(Fill::run);
+        return 1;
+    }
+    let queued = fills
+        .chunks(fills.len().div_ceil(jobs))
+        .map(|chunk| {
+            let owned = chunk.to_vec();
+            Box::new(move || owned.into_iter().for_each(Fill::run)) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(queued);
+    jobs
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+
+    fn fills(source: &[u8], dst: &mut [u8], bytes: usize) -> Vec<Fill> {
+        dst.chunks_exact_mut(bytes)
+            .enumerate()
+            .map(|(i, out)| Fill {
+                dst: out.as_mut_ptr() as usize,
+                src: source[i * bytes..].as_ptr() as usize,
+                len: bytes,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parallel_upload_fills_match_serial_bytes_and_follow_later_source_edits() {
+        let mut input: Vec<u8> = (0..512 * 448).map(|i| (i % 251) as u8).collect();
+        let mut serial = vec![0; input.len()];
+        let mut parallel = vec![0; input.len()];
+        let serial_jobs = fills(&input, &mut serial, 448);
+        let jobs = fills(&input, &mut parallel, 448);
+        for turn in [0x5a, 0x37] {
+            for b in &mut input {
+                *b ^= turn;
+            }
+            assert_eq!(run_fills(&serial_jobs, 1), 1);
+            assert_eq!(run_fills(&jobs, 4), 4);
+            assert_eq!(parallel, input);
+            assert_eq!(parallel, serial);
+        }
+    }
+
+    #[test]
+    fn overlapping_fills_keep_the_last_write_and_source_aliases_remain_ordered() {
+        let source: Vec<u8> = (0..256).map(|n| n as u8).collect();
+        let mut output = [0; 256];
+        let mut jobs = fills(&source, &mut output, 1);
+        jobs[255].dst = jobs[0].dst;
+        assert_eq!(run_fills(&jobs, 2), 1);
+        assert_eq!(output[0], 255);
+        let mut jobs = fills(&source, &mut output, 1);
+        jobs[0].src = source[167..].as_ptr() as usize;
+        jobs[1].src = jobs[0].dst;
+        assert_eq!(run_fills(&jobs, 2), 1);
+        assert_eq!(output[1], 167);
+    }
+
+    #[test]
+    fn short_fill_runs_stay_single_steps_and_other_steps_split_groups() {
+        let mut deferred = Deferred::default();
+        let fill = |n: usize| Fill {
+            dst: n,
+            src: n,
+            len: 1,
+        };
+        for n in 0..2 * FILLS_PER_JOB - 1 {
+            deferred.append_fill(fill(n), 4);
+        }
+        assert!(deferred.copies.iter().all(|s| matches!(s, Step::Fill(_))));
+        deferred.append_fill(fill(0), 4);
+        assert!(
+            matches!(deferred.copies.as_slice(), [Step::Fills(g)] if g.len() == 2 * FILLS_PER_JOB)
+        );
+        deferred.copies.push(Step::Copy(0, 0, 0));
+        for n in 0..2 * FILLS_PER_JOB {
+            deferred.append_fill(fill(n), 4);
+        }
+        assert!(matches!(
+            deferred.copies.as_slice(),
+            [Step::Fills(_), Step::Copy(..), Step::Fills(_)]
+        ));
+        let mut single = Deferred::default();
+        for n in 0..4 * FILLS_PER_JOB {
+            single.append_fill(fill(n), 1);
+        }
+        assert!(single.copies.iter().all(|s| matches!(s, Step::Fill(_))));
+    }
+
+    #[test]
+    fn a_title_copy_splits_fill_batches_on_a_replayed_command_list() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let mut source = vec![0x31; 512];
+        let mut before = vec![0; 512];
+        let mut after = vec![0; 512];
+        let next = vec![0xc4; 512];
+        for fill in fills(&source, &mut before, 1) {
+            list.deferred().append_fill(fill, 4);
+        }
+        // The last fill's source alone can still be written by a flight.
+        let last_byte = source.as_ptr() as usize + source.len() - 1;
+        assert_eq!(
+            blocked_by(&[(last_byte, last_byte + 1)], &[&list], false),
+            Some(WHY_READ)
+        );
+        list.defer_copy(source.as_mut_ptr(), next.as_ptr(), 512);
+        for fill in fills(&source, &mut after, 1) {
+            list.deferred().append_fill(fill, 4);
+        }
+        assert!(matches!(
+            list.deferred().copies.as_slice(),
+            [Step::Fills(_), Step::Copy(..), Step::Fills(_)]
+        ));
+        list.close();
+        for initial in [0x31, 0x72] {
+            source.fill(initial);
+            host.execute(&[&list]);
+            assert!(before.iter().all(|&b| b == initial));
+            assert_eq!(after, next);
+        }
+        list.reset();
+        assert!(list.deferred().copies.is_empty());
     }
 }
 
@@ -6718,6 +7137,14 @@ impl Meter {
                     if join_copies() { "on" } else { "off" }
                 );
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if fill_workers() > 1 {
+            let [batches, fills] =
+                [0, 1].map(|i| FILL_BATCHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "parallel upload preparation per frame: {batches:.1} batches, {fills:.0} fills"
+            );
         }
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;

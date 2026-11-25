@@ -3113,6 +3113,15 @@ struct Entry {
 
 /// Title buffers by (start address, resource), with their copy once made.
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// Counts the changes to [`BUFFERS`] that can give an unchanged buffer view
+/// another host copy: a title buffer made, released or let go of in place.
+static BUFFER_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Changes whenever the same title buffer view can resolve to another host
+/// copy ([`crate::descriptor::host::HostHeap::buffer_owner_current`]).
+pub(crate) fn buffer_generation() -> u64 {
+    BUFFER_GENERATION.load(Ordering::Acquire)
+}
 
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
@@ -3135,16 +3144,6 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     if buffers().remove(&(start, resource)).is_some() {
         BUFFER_GENERATION.fetch_add(1, Ordering::Release);
     }
-}
-
-/// Bumped whenever a title buffer appears, goes, or loses its in-place copy:
-/// a root view recorded earlier in a list may then name another buffer at
-/// the same address (`draw.rs` `RootSlot`).
-static BUFFER_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// The current [`BUFFER_GENERATION`].
-pub(crate) fn buffer_generation() -> u64 {
-    BUFFER_GENERATION.load(Ordering::Acquire)
 }
 
 #[cfg(test)]
