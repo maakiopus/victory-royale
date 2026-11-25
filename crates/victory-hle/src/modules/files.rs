@@ -449,7 +449,6 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
 // is opened first, and kept open until the read is done.
-
 pub extern "system" fn ReadFile(
     file: *mut c_void,
     buffer: *mut u8,
@@ -471,15 +470,20 @@ pub extern "system" fn ReadFile(
     done
 }
 
-/// The host CRT reads large requests straight into the caller's buffer.
+/// The host CRT reads large requests straight into the caller's buffer
+/// through the kernel, whose write fails on a guarded block instead of
+/// faulting into the guard. So the bytes are read beside, a chunk at a time
+/// (a caller may ask for far more than the file holds), and copied in from
+/// user mode, where a guarded block faults into the guard like the title's
+/// own writes. Returns the items read, as the CRT does; the bytes of a
+/// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
     let n = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
     );
     victory_gpu::kernel_wrote(buffer as usize, size.saturating_mul(count));
-    n
-}
+    n}
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
     match narrow(path) {
@@ -691,6 +695,40 @@ mod tests {
             0
         );
         assert_eq!((&out, n), (b"0123456789", 10));
+    }
+
+    #[test]
+    fn fread_reads_beside_in_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        // Over two chunks, and not a whole number of 3-byte items.
+        let bytes: Vec<u8> = (0..(5 << 19) + 1).map(|i| (i * 7 + i / 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
+        let open = || {
+            let f = _wfopen(w(&path.to_string_lossy()).as_ptr(), w("rb").as_ptr());
+            assert!(!f.is_null());
+            f
+        };
+
+        // Asked for far more than the file holds: the whole file, in items.
+        let f = open();
+        let mut out = vec![0xaau8; bytes.len() + 64];
+        let items = fread(out.as_mut_ptr(), 3, out.len() / 3, f);
+        assert_eq!(items, bytes.len() / 3);
+        assert_eq!(&out[..bytes.len()], &bytes[..], "the partial last item's bytes too");
+        assert!(out[bytes.len()..].iter().all(|&b| b == 0xaa), "nothing past what was read");
+        fclose(f);
+
+        // Exact reads continue where the last one stopped.
+        let f = open();
+        let mut a = vec![0u8; 1000];
+        let mut b = vec![0u8; (1 << 20) + 5];
+        assert_eq!(fread(a.as_mut_ptr(), 1000, 1, f), 1);
+        assert_eq!(fread(b.as_mut_ptr(), 1, b.len(), f), b.len());
+        assert_eq!(a, bytes[..1000]);
+        assert_eq!(b, bytes[1000..1000 + b.len()]);
+        fclose(f);
     }
 
     fn text(v: &[u16]) -> String {
