@@ -13,6 +13,12 @@ rustc --edition 2024 --target x86_64-pc-windows-gnullvm -C target-feature=+crt-s
     echo 'Building the smoke fixture requires the gnullvm Rust target and LLVM-MinGW (docs/proton-launcher.md).' >&2
     exit 1
 }
-"$root/scripts/victory-proton.sh" "$title" --execute 2>&1 | tee "$work/run.log"
-# pipefail checks the launcher. Also check the return value printed by VIctory.
+# VIctory exits with the status the title's entry point returned, which this
+# fixture makes 42 when both of its imports worked. So a successful run ends
+# 42, not 0: check that exact status rather than letting a non-zero one end
+# the script, and check the line VIctory printed as well.
+status=0
+"$root/scripts/victory-proton.sh" "$title" --execute > "$work/run.log" 2>&1 || status=$?
+cat -- "$work/run.log"
+test "$status" -eq 42
 grep -Eq '^title exited with 42[[:space:]]*$' "$work/run.log"

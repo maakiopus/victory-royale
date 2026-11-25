@@ -210,12 +210,20 @@ fn main() -> Result<()> {
             title_args: _,
         } => {
             let result = run::run(&exe, unimplemented, strict, execute, console);
-            // The process's own end, as `main`'s Result maps it: Ok is 0,
-            // Err is 1. A title that ends the process itself logs its own
-            // line and never returns here.
-            let code = if result.is_ok() { 0 } else { 1 };
+            // The process's own end: the status the title's entry point
+            // returned, else 1 as `main`'s Result maps an Err. A title that
+            // ends the process itself logs its own line and never returns
+            // here.
+            let code = result.as_ref().map_or(1, |code| *code);
             tracing::info!("runtime exit: code {code}");
-            result
+            result?;
+            if code != 0 {
+                // A caller that checks the status sees the title's own, not
+                // a success. `ExitProcess` takes a UINT, so all 32 bits of
+                // a status such as 0xC000_0005 reach the parent.
+                std::process::exit(code as i32);
+            }
+            Ok(())
         }
         Command::Config => show_config(),
     }
