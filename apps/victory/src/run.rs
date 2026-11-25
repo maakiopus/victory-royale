@@ -6,6 +6,45 @@ use anyhow::Result;
 
 use crate::{Console, Unimplemented};
 
+/// Lets a run start on a CPU without AVX2 (`VICTORY_SKIP_CPU_CHECK=1`), for
+/// a CPU emulator that reports no AVX2 but runs the instructions anyway.
+/// Not a diagnostics switch: a release build needs it too, since the check
+/// it bypasses refuses the run.
+#[cfg(any(windows, test))]
+const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
+
+/// Whether the title may run although the host reports no AVX2.
+///
+/// Split from [`check_cpu_features`] so the decision is testable without
+/// reading this machine's CPU or the process environment.
+#[cfg(any(windows, test))]
+fn check_cpu_features_with(has_avx2: bool, skip: Option<&str>) -> Result<()> {
+    if has_avx2 || skip == Some("1") {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this CPU does not support AVX2, which Xbox Series titles require; \
+         set {SKIP_CPU_CHECK_ENV}=1 to run anyway (for example under a CPU \
+         emulator that runs AVX2 without reporting it)"
+    );
+}
+
+/// Before any title code runs: Xbox Series binaries are compiled for Zen 2
+/// and use AVX2 unconditionally, so on a host without it the title faults
+/// with an illegal instruction somewhere inside its own code, far from the
+/// cause. Refuse here instead, where the message can say why.
+#[cfg(windows)]
+fn check_cpu_features() -> Result<()> {
+    // Read from the CPU, never from a build-time assumption about one
+    // machine: the same binary runs on hosts of both vendors and ages.
+    #[cfg(target_arch = "x86_64")]
+    let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_avx2 = true;
+    let skip = std::env::var(SKIP_CPU_CHECK_ENV).ok();
+    check_cpu_features_with(has_avx2, skip.as_deref())
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -18,6 +57,9 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    if execute {
+        check_cpu_features()?;
+    }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
@@ -343,4 +385,35 @@ mod tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// The AVX2 pre-flight, decided from values the test supplies: no CPUID
+/// read and no environment, so the result is the same on every machine.
+#[cfg(test)]
+mod cpu_check_tests {
+    use super::{SKIP_CPU_CHECK_ENV, check_cpu_features_with};
+
+    #[test]
+    fn avx2_present_runs_whatever_the_switch_says() {
+        for skip in [None, Some("0"), Some("1"), Some("")] {
+            assert!(check_cpu_features_with(true, skip).is_ok(), "{skip:?}");
+        }
+    }
+
+    #[test]
+    fn avx2_missing_is_refused_with_a_message_that_names_the_way_out() {
+        for skip in [None, Some(""), Some("0"), Some("true")] {
+            let message = check_cpu_features_with(false, skip)
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("AVX2"), "{message}");
+            assert!(message.contains("Xbox Series"), "{message}");
+            assert!(message.contains(SKIP_CPU_CHECK_ENV), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_switch_runs_a_title_on_a_cpu_without_avx2() {
+        assert!(check_cpu_features_with(false, Some("1")).is_ok());
+    }
 }
