@@ -81,12 +81,21 @@ def analyse(log: Path, captures: Path) -> int:
     # A large PNG can still be a black loading screen. Measure luminance of
     # the biggest captures so the sweep flags "reachable but renders nothing".
     brightness: list[tuple[str, float]] = []
+    tint: list[tuple[str, float, float, float, float]] = []
     try:
         from PIL import Image, ImageStat
 
         for p in sorted(big, key=lambda x: x.stat().st_size, reverse=True)[:8]:
-            mean = ImageStat.Stat(Image.open(p).convert("L")).mean[0]
+            rgb = Image.open(p).convert("RGB")
+            stat = ImageStat.Stat(rgb)
+            mean = ImageStat.Stat(rgb.convert("L")).mean[0]
             brightness.append((p.name, mean))
+            (r, g, b) = stat.mean
+            blown = sum(
+                1 for px in rgb.resize((240, 135)).getdata()
+                if min(px) >= 240
+            ) / (240 * 135)
+            tint.append((p.name, r, g, b, blown))
     except ImportError:
         pass
     if brightness:
@@ -95,6 +104,15 @@ def analyse(log: Path, captures: Path) -> int:
               f"bright_ge80={sum(m >= 80 for m in means)}/{len(means)}")
         print(f"  darkest={min(brightness, key=lambda x: x[1])} "
               f"brightest={max(brightness, key=lambda x: x[1])}")
+        if tint:
+            # A healthy capture keeps its blue channel. A broken post-process
+            # or pixel output drops it: R/G stay high while B collapses.
+            cast = [max(r, g) / max(b, 1.0) for _, r, g, b, _ in tint]
+            blown = [x[4] for x in tint]
+            print(f"capture_color mean_r={sum(x[1] for x in tint)/len(tint):.1f} "
+                  f"mean_g={sum(x[2] for x in tint)/len(tint):.1f} "
+                  f"mean_b={sum(x[3] for x in tint)/len(tint):.1f} "
+                  f"color_cast={max(cast):.2f} blown_frac={max(blown):.3f}")
 
     print(f"log_lines={len(lines)} captures={len(pngs)} nonblank={len(big)}")
     print(f"world_marker={world or 'NONE'}")
@@ -115,10 +133,19 @@ def analyse(log: Path, captures: Path) -> int:
 
     # A sweep fails if anything that should render is missing or errors appear.
     dark_screen = bool(brightness) and all(m < 80 for _, m in brightness)
+    color_cast = bool(tint) and all(
+        max(r, g) / max(b, 1.0) > 1.6 for _, r, g, b, _ in tint
+    )
+    blown = bool(tint) and max(x[4] for x in tint) > 0.25
     ok = (bool(world) and not faults and not shader_drops and not black_frames
-          and not dark_screen)
+          and not dark_screen and not color_cast)
     if dark_screen:
         print("DARK_SCREEN: every large capture is a dark loading screen, not the world")
+    if color_cast:
+        print("COLOR_CAST: blue channel collapsed in every large capture; pixel "
+              "output or post-processing is broken")
+    if blown:
+        print("BLOWN_HIGHLIGHTS: large fully-white regions in the captures")
     print(f"VERDICT={'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
