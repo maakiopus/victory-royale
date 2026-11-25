@@ -860,24 +860,69 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// Last pixel probe, carried across frames where no probe ran.
+///
+/// `None` means no frame has been probed yet. A dark frame before any
+/// non-black observation is a loading screen, not a frame that went black.
+#[cfg(any(all(windows, feature = "diagnostics"), test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlackWatch {
+    seen: Option<bool>,
+    drawn: u64,
+    frames: u64,
+}
+
+#[cfg(any(all(windows, feature = "diagnostics"), test))]
+impl BlackWatch {
+    pub(crate) const fn new() -> Self {
+        Self {
+            seen: None,
+            drawn: 0,
+            frames: 0,
+        }
+    }
+
+    /// Folds one present into the watcher. `shown` is `None` when no probe
+    /// ran; such frames keep the last observation instead of pretending the
+    /// frame was not black.
+    pub(crate) fn advance(&mut self, shown: Option<bool>, drawn: u64) -> bool {
+        let warn = shown == Some(true) && self.seen == Some(false);
+        if let Some(black) = shown {
+            self.seen = Some(black);
+        }
+        self.drawn = drawn;
+        if warn {
+            self.frames += 1;
+        }
+        warn
+    }
+
+    pub(crate) fn drawn(&self) -> u64 {
+        self.drawn
+    }
+
+    pub(crate) fn frames(&self) -> u64 {
+        self.frames
+    }
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
-    static LAST: std::sync::Mutex<(bool, u64, u64)> = std::sync::Mutex::new((false, 0, 0));
+    static LAST: std::sync::Mutex<BlackWatch> = std::sync::Mutex::new(BlackWatch::new());
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let drawn = crate::draw::drawn();
-    let black = shown.unwrap_or(false);
     let draws = crate::draw::take_frame();
-    if black && !last.0 {
-        last.2 += 1;
+    let previous = last.drawn();
+    if last.advance(shown, drawn) {
         tracing::warn!(
             frame,
             resource = ?resource,
             state = format_args!("{state:#x}"),
-            draws = drawn - last.1,
+            draws = drawn - previous,
             copied = shown.is_some(),
-            black_frames = last.2,
+            black_frames = last.frames(),
             levels = ?crate::capture::recent_levels(),
             "a black frame after a frame that was not"
         );
@@ -891,7 +936,6 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
     if AFTER.load(Ordering::Relaxed) == frame {
         tracing::warn!(frame, levels = ?crate::capture::recent_levels(), "levels after the black frame");
     }
-    *last = (black, drawn, last.2);
 }
 
 /// A run of destination pages: how they are mapped (0 pool pages from
@@ -1027,6 +1071,89 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn black_watch_needs_a_prior_nonblack_frame() {
+        let mut watch = BlackWatch::new();
+        assert!(!watch.advance(Some(true), 1));
+        assert!(!watch.advance(None, 2));
+        assert!(!watch.advance(Some(true), 3));
+        assert_eq!(watch.frames(), 0);
+    }
+
+    #[test]
+    fn black_watch_unprobed_frames_keep_the_observation() {
+        let mut watch = BlackWatch::new();
+        assert!(!watch.advance(Some(false), 1));
+        assert!(watch.advance(Some(true), 2));
+        for frame in 3..10 {
+            assert!(!watch.advance(None, frame));
+        }
+        assert!(!watch.advance(Some(true), 10));
+        assert_eq!(watch.frames(), 1);
+    }
+
+    #[test]
+    fn black_watch_counts_one_transition() {
+        let mut watch = BlackWatch::new();
+        assert!(!watch.advance(Some(false), 1));
+        assert!(watch.advance(Some(true), 2));
+        assert!(!watch.advance(Some(true), 3));
+        assert!(!watch.advance(Some(false), 4));
+        assert!(watch.advance(Some(true), 5));
+        assert_eq!(watch.frames(), 2);
+        assert_eq!(watch.drawn(), 5);
+    }
+
+    // The shader and pipeline builders are Windows-only, so these source
+    // checks run on every host and guard the two compile-time defects that
+    // used to make the indirect clamp and the depth plane unavailable.
+
+    /// Body of a raw HLSL constant, so assertions do not match comments or
+    /// other shaders in the same file.
+    fn hlsl<'a>(source: &'a str, name: &str) -> &'a str {
+        let marker = format!("const {name}: &str = r#\"");
+        let start = source
+            .find(&marker)
+            .unwrap_or_else(|| panic!("no const {name}"))
+            + marker.len();
+        let rest = &source[start..];
+        let end = rest.find("\"#;").expect("unterminated HLSL");
+        &rest[..end]
+    }
+
+    #[test]
+    fn indirect_clamp_does_not_call_interlocked_max() {
+        let clamp = hlsl(include_str!("indirect.rs"), "SOURCE");
+        assert!(
+            !clamp.contains("InterlockedMax"),
+            "SM 5.1 byte-address buffers have no InterlockedMax"
+        );
+        assert!(
+            clamp.contains("budget.InterlockedCompareExchange(4, was, g.x, prev)"),
+            "the diagnostic max must use a compare/exchange loop"
+        );
+    }
+
+    #[test]
+    fn depth_plane_root_signature_is_serialized() {
+        let source = include_str!("host.rs");
+        for name in ["PLANE_STEPS", "PLANE_FLOATS"] {
+            let shader = hlsl(source, name);
+            assert!(
+                !shader.contains("[RootSignature("),
+                "{name} must not embed a compiler root signature"
+            );
+        }
+        assert!(
+            source.contains("D3D12SerializeRootSignature("),
+            "the plane pipeline must serialize its own root signature"
+        );
+        assert!(
+            source.contains("let root = plane_root(device)?"),
+            "the plane pipeline must use the serialized root signature"
+        );
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's
