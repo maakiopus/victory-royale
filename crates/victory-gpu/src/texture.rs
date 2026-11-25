@@ -1474,7 +1474,9 @@ mod first_mip_tests {
         );
     }
 
-    /// A 2-D view's first mip is its fifth word; other views show all mips.
+    /// A 2-D view's first mip is its fifth word, an array view's too (the
+    /// layout says whether its memory can end behind the smaller mips);
+    /// a multisampled array view's fifth word is a slice.
     #[test]
     fn a_2d_view_names_its_first_mip() {
         assert_eq!(
@@ -1482,9 +1484,14 @@ mod first_mip_tests {
             4
         );
         assert_eq!(
-            crate::resource::first_mip(&[71, 5, 0x1688, 0, 4, 5, 0, 0, 0, 0]),
-            0,
+            crate::resource::first_mip(&[71, 5, 0x1688, 0, 4, 5, 0, 1, 0, 0]),
+            4,
             "an array view"
+        );
+        assert_eq!(
+            crate::resource::first_mip(&[71, 7, 0x1688, 0, 4, 5, 0, 0, 0, 0]),
+            0,
+            "a multisampled array view"
         );
         assert_eq!(
             crate::resource::first_mip(&[71, 4, 0x1688, 0, 99, 5, 0, 0, 0, 0]),

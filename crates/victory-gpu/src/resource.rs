@@ -2380,13 +2380,31 @@ pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
     Some(bytes.next_multiple_of(t.alignment.max(1)).min(whole))
 }
 
-/// The first mip a placed texture's view shows: of views of one 2D texture
-/// (the others show whole textures).
-#[cfg(windows)]
+/// The first mip a placed texture's view shows: its fifth word in every
+/// view dimension that has mips (1D, 2D, their arrays, 3D, cube, cube
+/// array); none in buffer and multisampled views, whose fifth word is
+/// something else. Whether the memory behind the larger mips is left out
+/// is the layout's to say (`Layout::bytes_from`: only where one slice
+/// holds its chain). The title views single-slice textures it streams as
+/// 2D arrays of one slice too: taken for the whole chain, such a view
+/// lay over the texture placed right behind its smaller mips, and the
+/// newer one's write made it stale for good (black, run of 2026-11-25:
+/// "a texture view nothing brings up to date ... Other ... its view
+/// [47, 5, 1688, 0, 3, 5, 0, 1, ..]").
+#[cfg(any(windows, test))]
 pub(crate) fn first_mip(view: &[u32]) -> u32 {
-    const TEXTURE_2D_VIEW: u32 = 4;
+    /// View dimensions whose fifth word is the most detailed mip.
+    const MIPPED: [u32; 7] = [
+        2,  // 1D
+        3,  // 1D array
+        4,  // 2D
+        5,  // 2D array
+        8,  // 3D
+        9,  // cube
+        10, // cube array
+    ];
     match *view {
-        [_, TEXTURE_2D_VIEW, _, _, first, ..] => first.min(15),
+        [_, dimension, _, _, first, ..] if MIPPED.contains(&dimension) => first.min(15),
         _ => 0,
     }
 }
@@ -3814,5 +3832,68 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+}
+
+#[cfg(test)]
+mod first_mip_tests {
+    use super::first_mip;
+    use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    /// A 512x512 BC1 texture of 8 mips in 4 KiB pages, of `slices` slices.
+    fn layout(slices: u32) -> victory_formats::texture::Layout {
+        let desc = TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 512,
+            height: 512,
+            depth_or_array: slices,
+            mips: 8,
+            format: 71,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        };
+        Texture::new(&desc).unwrap().planes[0].layout.clone()
+    }
+
+    /// Every view dimension with mips names its first one in the fifth
+    /// word; buffer and multisampled views (whose fifth word is an element
+    /// or a slice) show all of a texture.
+    #[test]
+    fn views_with_mips_name_their_first_mip() {
+        for dimension in [2, 3, 4, 5, 8, 9, 10] {
+            assert_eq!(
+                first_mip(&[71, dimension, 0x1688, 0, 3, 5, 0, 1, 0, 0]),
+                3,
+                "dimension {dimension}"
+            );
+        }
+        for dimension in [0, 1, 6, 7, 11] {
+            assert_eq!(
+                first_mip(&[71, dimension, 0x1688, 0, 3, 5, 0, 1, 0, 0]),
+                0,
+                "dimension {dimension}"
+            );
+        }
+        assert_eq!(first_mip(&[71, 5, 0x1688, 0, 99, 5, 0, 1, 0, 0]), 15);
+        assert_eq!(first_mip(&[71, 5, 0x1688]), 0, "too short");
+    }
+
+    /// The run's view `[47, 5, 1688, 0, 3, 5, 0, 1, ..]`: a one-slice 2D
+    /// array view from mip 3 of a 512x512 BC1 texture with the next
+    /// texture placed 4 KiB behind it. The memory it describes ends
+    /// before that texture; taken for the whole chain it lay over it (and
+    /// was made stale by it). A texture of two slices still takes all.
+    #[test]
+    fn a_one_slice_array_view_ends_before_the_next_texture() {
+        let one = layout(1);
+        let first = first_mip(&[0x47, 5, 0x1688, 0, 3, 5, 0, 1, 0, 0]);
+        assert!(
+            one.bytes_from(first) <= 0x1000,
+            "{} bytes",
+            one.bytes_from(first)
+        );
+        assert!(one.size > 0x1000);
+        let two = layout(2);
+        assert_eq!(two.bytes_from(first), two.size);
     }
 }
