@@ -50,6 +50,7 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("emit/container.rs"),
         include_str!("emit/diff_tests.rs"),
         include_str!("emit/host.rs"),
+        include_str!("emit/insn_lower_tests.rs"),
         include_str!("emit/intersect.rs"),
         include_str!("emit/intersect_tests.rs"),
         include_str!("emit/lower.rs"),

@@ -86,6 +86,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(test)]
+mod insn_lower_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 mod lower;
