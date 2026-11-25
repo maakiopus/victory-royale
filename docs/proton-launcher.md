@@ -52,6 +52,13 @@ prefix is `${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton`, and the
 default `GAMEID` is `umu-victory`. Set `WINEPREFIX`, `GAMEID` or `PROTONPATH`
 to override them. Use Windows paths in `victory.toml`.
 
+When Steam's `Proton - Experimental` is installed, the launcher selects it
+automatically. That runtime does not accept `Z:` paths, so the launcher gives
+UMU Unix paths and sets `STEAM_COMPAT_INSTALL_PATH` to a symlink under the
+Steam library, with `STEAM_COMPAT_LIBRARY_PATHS` pointing at that library.
+This is the configuration used to reach the first world frame on Linux.
+Set `PROTONPATH` to another build to keep the `Z:` path behaviour.
+
 The launcher creates shader-cache directories at
 `${XDG_CACHE_HOME:-$HOME/.cache}/victory/vkd3d` and
 `${XDG_CACHE_HOME:-$HOME/.cache}/victory/dxvk`, keeping generated caches out

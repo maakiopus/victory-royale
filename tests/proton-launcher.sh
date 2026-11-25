@@ -12,6 +12,9 @@ cat > "$work/bin/umu-run" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$@" > "$LAUNCH_RECORD"
 printf '%s\n' "$WINEPREFIX" "$VKD3D_SHADER_CACHE_PATH" "$DXVK_STATE_CACHE_PATH" > "$ENV_RECORD"
+if [[ -n ${STEAM_RECORD:-} ]]; then
+    printf '%s\n' "${STEAM_COMPAT_INSTALL_PATH:-}" "${STEAM_COMPAT_LIBRARY_PATHS:-}" > "$STEAM_RECORD"
+fi
 if [[ -n ${EXPECTED_RUNTIME:-} ]]; then
     exe=${1#Z:}
     exe=${exe//\\/\/}
@@ -129,4 +132,34 @@ read -r launched < "$LAUNCH_RECORD"
 expected="$work/extracted bundle/victory.exe"
 test "$launched" = "Z:${expected//\//\\}"
 if bash "$work/extracted bundle/victory-proton.sh" --build 2>/dev/null; then exit 1; fi
+
+# Steam's Proton Experimental gets Unix paths and a compat install symlink.
+export VICTORY_EXE="$work/build with spaces/victory.exe"
+export STEAM_RECORD="$work/steam-env"
+unset PROTONPATH STEAM_COMPAT_INSTALL_PATH STEAM_COMPAT_LIBRARY_PATHS
+steam_root="$HOME/.local/share/Steam"
+experimental="$steam_root/steamapps/common/Proton - Experimental"
+mkdir -p "$experimental"
+printf '1794497090 experimental-11.0-20261112-x86_64\n' > "$experimental/version"
+bash "$launcher" "$work/game with spaces/title.exe" --execute
+mapfile -t launched_args < "$LAUNCH_RECORD"
+test "${launched_args[0]}" = "$VICTORY_EXE"
+test "${launched_args[1]}" = run
+test "${launched_args[2]}" = "$work/game with spaces/title.exe"
+mapfile -t steam_env < "$STEAM_RECORD"
+test "${steam_env[0]}" = "$steam_root/steamapps/common/victory-run"
+test "${steam_env[1]}" = "$steam_root/steamapps"
+test "$(readlink -- "${steam_env[0]}")" = "$work/build with spaces"
+
+# A stale or dangling symlink is repointed at the current build.
+mkdir -p "$work/other build"
+touch "$work/other build/victory.exe"
+ln -sfn "$work/other build" "${steam_env[0]}"
+export VICTORY_EXE="$work/other build/victory.exe"
+bash "$launcher" "$work/game with spaces/title.exe"
+test "$(readlink -- "${steam_env[0]}")" = "$work/other build"
+rm -rf -- "$work/build with spaces"
+bash "$launcher" "$work/game with spaces/title.exe"
+test "$(readlink -- "${steam_env[0]}")" = "$work/other build"
+
 echo 'Proton launcher checks passed.'
