@@ -14,6 +14,7 @@ GAME=${SWEEP_GAME:-W:\\hdd\\GTA6.Xbox.v1.0.2.1-CYBERLEEK\\game_scarlett_master.e
 PROTON=${PROTONPATH:-$HOME/.local/share/Steam/steamapps/common/Proton - Experimental}
 DURATION=${SWEEP_DURATION:-660}
 KEYS=${SWEEP_KEYS:-20:Enter,70:Enter}
+LOG_FILTER=${SWEEP_LOG:-victory_gpu::frame=debug,info}
 
 mkdir -p "$WORK"
 BAT="$WORK/game.bat"
@@ -26,7 +27,7 @@ ZEXE=$(printf '%s' "$EXE" | sed 's#^/tmp/#Z:\\tmp\\#; s#^/home/#Z:\\home\\#; s#/
 
 cat > "$BAT" <<EOF
 @echo off
-set VICTORY_LOG=victory_gpu::frame=debug,info
+set VICTORY_LOG=$LOG_FILTER
 set VICTORY_KEYS=$KEYS
 set VICTORY_CAPTURE=Z:\\tmp\\opencode\\sweep-$LABEL\\capture
 set VICTORY_CAPTURE_WORLD=0,3
