@@ -51,6 +51,8 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(any(windows, test))]
+mod raw_indirect;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

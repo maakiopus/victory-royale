@@ -3325,6 +3325,20 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
+        // `VICTORY_INDIRECT_RAW=3`: a single draw whose record the CPU
+        // checked runs from the title's record, with no clamp pass
+        // (`crate::raw_indirect`).
+        let call = crate::raw_indirect::Call {
+            kind,
+            stride,
+            max,
+            offset,
+            counted: count.is_some(),
+        };
+        if crate::raw_indirect::trust(call, arguments) {
+            self.window = None;
+            return self.draw_raw(list, kind, (&args, arguments, len), &signature);
+        }
         // A dispatch that may have more groups than the host runs in one
         // dimension, by a program that takes the number of its first group.
         let parts = if kind == DISPATCH && max == 1 && count.is_none() {
@@ -3505,6 +3519,57 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        true
+    }
+}
+
+impl State {
+    /// A single draw or indexed draw run from the title's record in its
+    /// host copy (`crate::raw_indirect::trust` said yes): the copy is
+    /// brought up to date at submission as for the clamp, and read by
+    /// `ExecuteIndirect` itself.
+    fn draw_raw(
+        &mut self,
+        list: &HostList,
+        kind: u32,
+        (args, arguments, len): (&std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+        signature: &ID3D12CommandSignature,
+    ) -> bool {
+        args.refresh(list, arguments, len);
+        if !self.prepare(list, kind == crate::raw_indirect::INDEXED) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!("indirect kind {kind}: prepare failed"));
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            self.op_text(
+                format!("indirect kind {kind} max 1 at {arguments:#x} (raw)"),
+                false,
+            )
+        });
+        // SAFETY: an open list with everything set; the list keeps the host
+        // copy alive (its refresh), and the signature is cached. The record
+        // was checked on the CPU (`crate::raw_indirect`).
+        unsafe {
+            list.list
+                .ExecuteIndirect(signature, 1, &args.buffer, args.offset(arguments), None, 0)
+        };
+        #[cfg(feature = "diagnostics")]
+        self.dump_after(list);
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::recording_listed() {
+            list.keep(&args.buffer);
+            let name = crate::pipeline::shaders_of(self.pipeline as This);
+            crate::capture::read_indirect(
+                list,
+                crate::capture::Records::Title(&args.buffer, args.offset(arguments)),
+                None,
+                (kind, len as u32, 1),
+                name,
+            );
+        }
+        DRAWN.fetch_add(1, Ordering::Relaxed);
         true
     }
 }

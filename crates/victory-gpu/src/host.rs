@@ -5826,6 +5826,7 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        crate::raw_indirect::card_writes(dst as u64, len as u64);
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
@@ -5899,6 +5900,11 @@ impl HostList {
         [row, rows, pitch]: [usize; 3],
         source: crate::object::This,
     ) {
+        let span = rows
+            .saturating_sub(1)
+            .saturating_mul(pitch)
+            .saturating_add(row);
+        crate::raw_indirect::card_writes(dst as u64, span as u64);
         let recorded = crate::frame::current();
         self.deferred().backs.push((
             buffer,
@@ -5918,6 +5924,7 @@ impl HostList {
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
+        crate::raw_indirect::card_writes(dst as u64, bytes as u64);
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
@@ -7088,6 +7095,7 @@ impl Meter {
             [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        crate::raw_indirect::line(frames);
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
