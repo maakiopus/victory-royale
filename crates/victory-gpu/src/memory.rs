@@ -38,25 +38,23 @@
 //! memory module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
+//! each view heap grows its descriptor run as more copies are needed.
+//! Every dispatch of such a shader brings its addressable copies up to
 //! date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use std::collections::HashMap;
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
+
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
-/// Copies that can be numbered (the run of heap slots is one longer). A
-/// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -68,9 +66,9 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
+    /// Shadow IDs are unique for the lifetime of a backing, including after
+    /// the guest reuses its address.
+    numbers: HashMap<u64, usize>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -89,6 +87,9 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// Last numbered copy this draw prepared. Other recording threads can
+    /// subsequently add mappings to the same directory.
+    pub(crate) count: u32,
 }
 
 impl Memory {
@@ -108,10 +109,23 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
-            heaps: HashMap::new(),
+            numbers: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
         })
+    }
+
+    /// Assign a stable slot to a copy. Older recordings keep their slot even
+    /// after the guest reuses the address.
+    fn number(&mut self, shadow: &Arc<Shadow>) -> Option<usize> {
+        if let Some(&index) = self.numbers.get(&shadow.id()) {
+            return Some(index);
+        }
+        // The directory stores a one-based u32 slot; zero is the null view.
+        u32::try_from(self.copies.len()).ok()?.checked_add(1)?;
+        self.numbers.insert(shadow.id(), self.copies.len());
+        self.copies.push(shadow.clone());
+        Some(self.copies.len() - 1)
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
@@ -152,39 +166,31 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
-            Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
-                self.copies.push(shadow.clone());
-                let n = self.copies.len() - 1;
-                // Every page the copy holds whole, not only the one asked
-                // for: a structure is more than 64 KiB.
-                // shortcut: a page of a title buffer inside this one that
-                // has a copy of its own is given this copy too.
-                let (first, len) = shadow.span();
-                let mut at = first.next_multiple_of(PAGE);
-                while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
-                    // SAFETY: inside the directory's mapping.
-                    let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
-                    // SAFETY: as above; the offset first, as below.
-                    unsafe {
-                        if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
-                            other.write_volatile(n as u32 + 1);
-                        }
-                    }
-                    at += PAGE;
-                }
-                n
-            }
-            None => {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
-                });
-                return;
-            }
+        let known = self.numbers.contains_key(&shadow.id());
+        let before = self.copies.len();
+        let Some(n) = self.number(&shadow) else {
+            return;
         };
+        if !known && self.copies.len() != before {
+            // Every page the copy holds whole, not only the one asked
+            // for: a structure is more than 64 KiB.
+            // shortcut: a page of a title buffer inside this one that
+            // has a copy of its own is given this copy too.
+            let (first, len) = shadow.span();
+            let mut at = first.next_multiple_of(PAGE);
+            while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+                // SAFETY: inside the directory's mapping.
+                let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+                // SAFETY: as above; the offset first, as below.
+                unsafe {
+                    if other.read() == 0 {
+                        other.add(1).write_volatile((at - first) as u32);
+                        other.write_volatile(n as u32 + 1);
+                    }
+                }
+                at += PAGE;
+            }
+        }
         let offset = shadow.offset_in(start).unwrap_or(0);
         // The offset first: a shader that sees the number sees it too.
         // SAFETY: inside the directory's mapping.
@@ -275,21 +281,7 @@ pub(crate) fn ready(
             m.name(u64::from(c) << 8);
         }
     }
-    let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
-        None => {
-            // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
-            heap.null_raw_uav_at(base);
-            (base, 0)
-        }
-    };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
-    }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    let (base, count) = heap.raw_page_views(&m.copies)?;
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
@@ -315,5 +307,6 @@ pub(crate) fn ready(
         directory: m.directory.2,
         faults: m.faults.2,
         base,
+        count,
     })
 }

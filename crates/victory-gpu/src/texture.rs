@@ -1221,18 +1221,64 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
-/// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again). So a
-/// texture of which only blocks between its ends are mapped reads as none:
-/// [`mapped_bytes_between`] makes sure.
+/// one not there. A texture can also have only interior mips present while
+/// streaming. Windows can skip each uncommitted run in a single query.
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    if len == 0
-        || !committed(at, 1) && !committed((at as usize).saturating_add(len - 1) as *const u8, 1)
-    {
+    let start = at as usize;
+    let end = start.saturating_add(len);
+    if start == end {
         return 0;
     }
-    mapped_bytes_between(at, len)
+    let query = by_query();
+    let ends_missing = !query && !committed(at, 1) && !committed((end - 1) as *const u8, 1);
+    // Both ends missing says none only when no whole page can lie between
+    // them (two queries for the slots whose texture is away, asked again
+    // and again).
+    if ends_missing && (end - 1) / 4096 - start / 4096 <= 1 {
+        return 0;
+    }
+    if !query && !ends_missing {
+        return mapped_bytes_between(at, len);
+    }
+    mapped_regions(start, end, false)
+}
+
+/// Whether any byte of `[start, start + len)` is committed and readable.
+pub(crate) fn any_mapped(start: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    mapped_regions(start, start.saturating_add(len), true) != 0
+}
+
+/// Bytes of `[start, end)` in committed, readable regions. With `first_only`
+/// it stops at the first one: a query skips each uncommitted run, so asking
+/// an interior-only texture costs one question rather than all of its pages.
+fn mapped_regions(start: usize, end: usize, first_only: bool) -> u64 {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let (mut p, mut there) = (start, 0u64);
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let next = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .min(end);
+        if n == 0 || next <= p {
+            break;
+        }
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+            there += (next - p) as u64;
+            if first_only {
+                break;
+            }
+        }
+        p = next;
+    }
+    there
 }
 
 /// [`mapped_bytes`] without its look at the ends first: every block (or
@@ -1619,12 +1665,12 @@ mod unseen_tests {
 
 #[cfg(test)]
 mod mapped_tests {
-    use super::{mapped_bytes, mapped_bytes_between};
+    use super::{any_mapped, mapped_bytes, mapped_bytes_between};
 
     /// A texture whose ends are not mapped and some blocks between them
-    /// are reads as none by its ends and as those blocks when every block
-    /// is asked; one not mapped at all is none both ways, and one mapped
-    /// whole is all of it both ways.
+    /// are found both by its ends' query and by asking every block; one not
+    /// mapped at all is none both ways, and one mapped whole is all of it
+    /// both ways.
     #[test]
     fn blocks_mapped_between_unmapped_ends_are_found_when_every_block_is_asked() {
         use windows_sys::Win32::System::Memory::*;
@@ -1643,7 +1689,8 @@ mod mapped_tests {
                 VirtualAlloc(middle.cast(), 2 * BLOCK, MEM_COMMIT, PAGE_READWRITE),
                 middle.cast()
             );
-            assert_eq!(mapped_bytes(base, SIZE), 0, "the ends alone say none");
+            assert_eq!(mapped_bytes(base, SIZE), 2 * BLOCK as u64);
+            assert!(any_mapped(base as usize, SIZE));
             assert_eq!(mapped_bytes_between(base, SIZE), 2 * BLOCK as u64);
             // Unmapped again: none both ways.
             assert_ne!(VirtualFree(middle.cast(), 2 * BLOCK, MEM_DECOMMIT), 0);
@@ -1654,6 +1701,34 @@ mod mapped_tests {
             );
             assert_eq!(mapped_bytes(base, SIZE), SIZE as u64);
             assert_eq!(mapped_bytes_between(base, SIZE), SIZE as u64);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn a_texture_with_only_interior_pages_counts_its_resident_bytes() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: this private reservation is ours throughout the test.
+        unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), 5 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let middle = base.add(2 * BLOCK);
+            assert_eq!(
+                VirtualAlloc(middle.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE),
+                middle.cast()
+            );
+            assert_eq!(mapped_bytes(base, 5 * BLOCK), BLOCK as u64);
+            assert!(any_mapped(base as usize, 5 * BLOCK));
+            assert_eq!(
+                mapped_bytes(base.add(BLOCK - 3), 2 * BLOCK + 9),
+                BLOCK as u64
+            );
+            assert_eq!(mapped_bytes(base, 2 * BLOCK), 0);
+            assert_ne!(VirtualFree(middle.cast(), BLOCK, MEM_DECOMMIT), 0);
+            assert_eq!(mapped_bytes(base, 5 * BLOCK), 0);
+            assert!(!any_mapped(base as usize, 5 * BLOCK));
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }

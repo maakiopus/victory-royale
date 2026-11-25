@@ -39,7 +39,8 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 ///   address space: the number of the host copy holding that page (0: none
 ///   yet) and the page's byte offset in that copy;
 /// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
-///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
+///   dword 0 of kind [`USER_MEMORY_BASE`]. Dword 1 is the last copy
+///   number prepared for the recorded bind; later numbers and slot `base` itself
 ///   reads zeros and drops writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the

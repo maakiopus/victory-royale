@@ -13,6 +13,14 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+const FIRST_RAW_PAGE_SLOTS: u32 = 1024;
+
+struct RawPageRun {
+    base: u32,
+    slots: u32,
+    populated: u32,
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -86,6 +94,10 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: Mutex<Spans>,
+    /// Raw-memory descriptor runs. Growth leaves older reservations valid
+    /// because recorded command lists still use their base. A recreated
+    /// shader-visible heap makes its own reservation.
+    raw_pages: Mutex<Option<RawPageRun>>,
 }
 
 /// Title memory by the placed texture views that describe it: per span of
@@ -270,6 +282,42 @@ static SWEEP: Mutex<(u32, [u64; 10], u64)> = Mutex::new((0, [0; 10], 0));
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// Keep the producer cheap while adjacent pages or repeated writes arrive.
+/// A full queue falls back to checking all tracked views once, so completed
+/// uploads are still invalidated when a remap arrives during a long pause.
+fn record_remap(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, limit: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    if let Some(last) = ranges.last_mut()
+        && last.0 <= end
+        && start <= last.1
+    {
+        last.0 = last.0.min(start);
+        last.1 = last.1.max(end);
+    } else if ranges.len() >= limit {
+        ranges.clear();
+        ranges.push((0, u64::MAX));
+        return true;
+    } else {
+        ranges.push((start, end));
+    }
+    false
+}
+
+/// Before looking up descriptor spans, merge notifications from interleaved
+/// producers. The consumer cares only which addresses changed in this batch.
+fn merge_remaps(ranges: &mut Vec<(u64, u64)>) {
+    ranges.sort_unstable();
+    ranges.dedup_by(|next, previous| {
+        if next.0 > previous.1 {
+            return false;
+        }
+        previous.1 = previous.1.max(next.1);
+        true
+    });
+}
+
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
 /// memory outside is none of the texture pass's business.
@@ -280,7 +328,7 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
+/// full-queue rescans; slots made due by such
 /// ranges; and made slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -310,20 +358,9 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    if record_remap(&mut ranges, start, end, MOST) {
+        STALE[2].fetch_add(1, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's
@@ -908,6 +945,7 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             placed: Mutex::default(),
+            raw_pages: Mutex::new(None),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1200,10 +1238,11 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
+        merge_remaps(&mut ranges);
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             ranges
@@ -1380,17 +1419,19 @@ impl HostHeap {
                 continue;
             }
             let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            if !crate::texture::committed(start as *const u8, 1) {
-                counts[4] += 1;
-                continue;
-            }
-            let (claim, against) = {
+            let (bytes, claim, against) = {
                 let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(bytes) = placed.bytes(&resource, crate::resource::first_mip(&desc)) else {
                     continue;
                 };
-                placed.claim(index, start, start.saturating_add(bytes), &resource)
+                let (claim, against) =
+                    placed.claim(index, start, start.saturating_add(bytes), &resource);
+                (bytes, claim, against)
             };
+            if !crate::texture::any_mapped(start as usize, bytes as usize) {
+                counts[4] += 1;
+                continue;
+            }
             counts[5 + claim as usize] += 1;
             counts[9] += u64::from(other);
             static SAID: [std::sync::atomic::AtomicU32; 4] =
@@ -1752,6 +1793,75 @@ impl HostHeap {
     pub(crate) fn null_raw_at(&self, index: u32) {
         null_buffer_view(self.cpu(index));
         self.keep(index, None);
+    }
+
+    /// Reserves a run of raw unordered access views for numbered copies of
+    /// title memory and returns the null view's slot and how many copies
+    /// have a view. Runs grow geometrically; older reservations stay valid
+    /// because recorded command lists still use their base.
+    pub(crate) fn raw_page_views(
+        &self,
+        copies: &[std::sync::Arc<crate::shadow::Shadow>],
+    ) -> Option<(u32, u32)> {
+        let mut run = self.raw_pages.lock().unwrap_or_else(|e| e.into_inner());
+        let requested = u32::try_from(copies.len()).ok()?;
+        let needed = requested.saturating_add(1);
+        if run
+            .as_ref()
+            .is_none_or(|r| needed > r.slots && r.slots < self.dynamic)
+        {
+            let slots = needed
+                .checked_next_power_of_two()
+                .unwrap_or(u32::MAX)
+                .max(FIRST_RAW_PAGE_SLOTS)
+                .min(self.dynamic);
+            let reservation = self.dynamic(slots).map(|base| (base, slots)).or_else(|| {
+                // An already fragmented heap can still expose a prefix on its
+                // first bind. Subsequent binds retry growth as lists release slots.
+                let small = needed.min(FIRST_RAW_PAGE_SLOTS);
+                if run.is_some() || small >= slots {
+                    return None;
+                }
+                self.dynamic(small).map(|base| (base, small))
+            });
+            if let Some((base, slots)) = reservation {
+                self.null_raw_uav_at(base);
+                if let Some(old) = run.as_ref() {
+                    tracing::info!(
+                        previous = old.slots,
+                        slots,
+                        "grew raw memory descriptor run"
+                    );
+                }
+                *run = Some(RawPageRun {
+                    base,
+                    slots,
+                    populated: 0,
+                });
+            }
+        }
+        let run = run.as_mut()?;
+        let count = requested.min(run.slots - 1);
+        if count < requested {
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| {
+                tracing::warn!(
+                    requested,
+                    count,
+                    "raw memory bindings are limited by the available descriptor heap"
+                );
+            });
+        }
+        for (n, shadow) in copies[..count as usize]
+            .iter()
+            .enumerate()
+            .skip(run.populated as usize)
+        {
+            let (_, len) = shadow.span();
+            self.raw_uav_at(run.base + 1 + n as u32, &shadow.buffer, 0, len);
+        }
+        run.populated = run.populated.max(count);
+        Some((run.base, count))
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3051,6 +3161,43 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_remaps_visit_each_changed_region_once() {
+        let mut ranges = Vec::new();
+        for (from, to) in [
+            (40, 50),
+            (30, 40),
+            (35, 40),
+            (10, 20),
+            (45, 60),
+            (60, 61),
+            (1, 1),
+        ] {
+            assert!(!record_remap(&mut ranges, from, to, 3));
+        }
+        merge_remaps(&mut ranges);
+        assert_eq!(ranges, [(10, 20), (30, 61)]);
+        // If no pass drains the queue, even the first and the overflowing
+        // notification must be seen by the next pass.
+        assert!(record_remap(&mut ranges, 90, 99, 2));
+        assert!(!record_remap(&mut ranges, 120, 160, 2));
+        assert_eq!(ranges, [(0, u64::MAX)]);
+    }
+
+    #[test]
+    fn recreated_heap_reserves_its_own_raw_page_views() {
+        let Some(mut heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_eq!(heap.raw_page_views(&[]), Some((4, 0)));
+        assert_eq!(heap.raw_page_views(&[]), Some((4, 0)));
+        assert_eq!(heap.dynamic(1), Some(4 + FIRST_RAW_PAGE_SLOTS));
+        heap = HostHeap::new(false, 4).unwrap();
+        assert_eq!(heap.dynamic(7), Some(4));
+        assert_eq!(heap.raw_page_views(&[]), Some((11, 0)));
+        assert_eq!(heap.dynamic(1), Some(11 + FIRST_RAW_PAGE_SLOTS));
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
