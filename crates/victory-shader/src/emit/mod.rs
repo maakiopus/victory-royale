@@ -84,6 +84,8 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
+#[cfg(test)]
+mod descriptor_size_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
