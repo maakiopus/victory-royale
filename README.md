@@ -165,6 +165,10 @@ Rendering:
 - Gathers at a named mip level (with and without an offset) read level 0; fixed.
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
+- Pixel shaders now read neighboring pixels through native quad operations, including at shared triangle edges, so helper lanes keep the coordinates of their own triangle. Cube-map gradient sampling selects the mip from the guest footprint and honors the instruction's minimum level.
+- The ray-tracing memory directory can grow past 1,023 backing buffers: each recorded draw or dispatch keeps the view count it was recorded with, and newer recordings can use more views.
+- Streamed textures can upload when only their middle pages are resident; overlapping memory notifications are merged and tracked textures are rescanned when the notification queue fills.
+- Depth-only pipelines are warmed ahead of speculative material pipelines, so shadow maps are prepared earlier.
 - Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
 
 Speed and memory:

@@ -269,6 +269,7 @@ mod tests {
         assert!(check("tools/linux-sweep/analyze.py", b"import re").is_empty());
 
         assert!(!check("other.py", b"pass").is_empty());
+        assert!(!check("other.py", b"MZ\x90\0").is_empty());
         assert!(!check("other.swift", b"import Metal").is_empty());
         assert!(!check("tests/metal/probe.swift", b"MZ\x00").is_empty());
         assert!(!check("tests/metal/run.py", &vec![b'a'; 800]).is_empty());

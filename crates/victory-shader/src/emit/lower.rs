@@ -2965,6 +2965,11 @@ impl<'a> Lower<'a> {
         // A page without a copy: its number, at a place by the number, or
         // at the sink for lanes that do not run and pages that have one.
         let zero = k(self, 0);
+        // A newer command list can publish more pages after this one has
+        // recorded. Only reference descriptors prepared for this particular bind.
+        let count = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 1);
+        let in_range = self.s.m.cmp(c, pred::IULE, copy, count);
+        let copy = self.s.m.select(c, in_range, copy, zero);
         let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
@@ -4626,11 +4631,38 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    /// Read this quad, including pixel helpers across a triangle edge.
+    /// Common broadcasts and exchanges need only one native quad operation.
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        match pattern {
+            Some(0xe4) => return x,
+            Some(p @ (0x00 | 0x55 | 0xaa | 0xff)) => {
+                let lane = self.s.m.i32(u32::from(p & 3));
+                return self.s.op(
+                    c,
+                    "quadReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    122,
+                    &[x, lane],
+                );
+            }
+            Some(p @ (0xb1 | 0x4e | 0x1b)) => {
+                // The low two bits select lane 0's partner: XOR 1, 2, or 3.
+                let direction = self.s.m.i8((p & 3) - 1);
+                return self.s.op(
+                    c,
+                    "quadOp.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    123,
+                    &[x, direction],
+                );
+            }
+            _ => {}
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -4776,10 +4808,8 @@ impl<'a> Lower<'a> {
             // of each group of 32 combine their index with and/or/xor masks.
             let quad = offset & 0x8000 != 0
                 || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
-            // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
-            // console's, so quad-local swizzles read through quad operations.
-            let mesh_quad = self.s.mesh.is_some() && quad;
-            if !mesh_quad {
+            let use_quad = quad && (self.s.pixel || self.s.mesh.is_some());
+            if !use_quad {
                 self.cross_lane(quad)?;
             }
             // The source sits in the address field.
@@ -4804,8 +4834,8 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
-                self.quad_pick(x, src)
+            let r = if use_quad {
+                self.quad_pick(x, src, (offset & 0x8000 != 0).then_some(offset as u8))
             } else {
                 self.read_lane(x, src)
             };
@@ -7020,10 +7050,14 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
-        let mesh_quad = self.s.mesh.is_some() && quad;
-        if !mesh_quad {
+        // DPP8 contains two quads. Each destination must select a source
+        // in its own quad before a quad read can implement the operation.
+        let quad = match dpp {
+            Dpp::Row { ctrl, .. } => ctrl <= 0xff,
+            Dpp::Lanes { sel, .. } => (0..8).all(|i| ((sel >> (3 * i)) ^ i) & 4 == 0),
+        };
+        let use_quad = quad && (self.s.pixel || self.s.mesh.is_some());
+        if !use_quad {
             self.cross_lane(quad)?;
         }
         let c = self.cur;
@@ -7101,8 +7135,12 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
-            self.quad_pick(x, src)
+        let mut r = if use_quad {
+            let pattern = match dpp {
+                Dpp::Row { ctrl, .. } => Some(ctrl as u8),
+                Dpp::Lanes { .. } => None,
+            };
+            self.quad_pick(x, src, pattern)
         } else {
             self.read_lane(x, src)
         };
@@ -10392,11 +10430,16 @@ impl<'a> Lower<'a> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    // DXIL Log already returns log2. A footprint of zero
+                    // gives -infinity and the sampler takes its finest mip.
+                    // SampleLevel has no clamp operand; apply the guest
+                    // instruction's minimum LOD before passing the level.
+                    let lod = self.unary(23, texels);
+                    let lod = if has_cl {
+                        self.binary(35, lod, clamp)
+                    } else {
+                        lod
+                    };
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(

@@ -559,6 +559,7 @@ const MAKING: u8 = 3;
 
 struct Queue {
     early: VecDeque<Arc<Pending>>,
+    early_depth: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
 }
 
@@ -566,6 +567,7 @@ impl Queue {
     const fn new() -> Self {
         Self {
             early: VecDeque::new(),
+            early_depth: VecDeque::new(),
             requested: VecDeque::new(),
         }
     }
@@ -580,6 +582,14 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED {
             self.requested.push_back(p.clone());
+        } else if p
+            .graphics
+            .as_ref()
+            .is_some_and(|state| state.writes_depth_only())
+        {
+            // Shadow maps and depth prepasses supply several later draws. Rebuild
+            // their previously used PSOs first while no draw is requesting one.
+            self.early_depth.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
         }
@@ -589,8 +599,12 @@ impl Queue {
     fn pop(&mut self) -> Option<Arc<Pending>> {
         let p = self.requested.pop_front().or_else(|| {
             // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+            std::iter::from_fn(|| {
+                self.early_depth
+                    .pop_front()
+                    .or_else(|| self.early.pop_front())
+            })
+            .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         let _ = p.claimed.set(Instant::now());
@@ -932,5 +946,29 @@ mod tests {
         // The worker returns at last: its answer is the pipeline's.
         p.make();
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn early_depth_precedes_other_prewarming_and_requests_precede_both() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
+        let depth_pipeline = || {
+            let mut depth = Box::new(GraphicsState::default());
+            let format = [16u32, DXGI_FORMAT_D32_FLOAT.0 as u32];
+            // SAFETY: a complete depth-format subobject of the title pipeline stream.
+            unsafe { depth.read(16, format.as_ptr().cast()) };
+            Arc::new(Pending::new(Vec::new(), Some(depth)))
+        };
+        let normal = Arc::new(Pending::new(Vec::new(), None));
+        let promoted = depth_pipeline();
+        let shadow = depth_pipeline();
+        let mut queue = Queue::new();
+        for p in [&normal, &shadow, &promoted] {
+            assert_eq!(queue.push(p, EARLY), Some(true));
+        }
+        assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
+        for expected in [&promoted, &shadow, &normal] {
+            assert!(Arc::ptr_eq(&queue.pop().unwrap(), expected));
+        }
+        assert!(queue.pop().is_none());
     }
 }
