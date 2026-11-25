@@ -122,11 +122,21 @@ mod imp {
 
     fn module(dll: &str) -> Option<usize> {
         let key = dll.to_ascii_lowercase();
-        let mut cache = MODULES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&m) = cache.get(&key) {
+        let cache = || MODULES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = cache().get(&key).copied() {
             return Some(m);
         }
         let name = CString::new(key.as_str()).ok()?;
+        // The load is deliberately outside the cache's lock. Loading a DLL
+        // that is not loaded yet takes the OS loader lock, and title code
+        // runs under that lock too (a title DLL's thread attach, the TLS
+        // callbacks that run as a thread starts), where it can need this
+        // cache: any first use of a `host!` function, or a late-bound title
+        // DLL. Holding the cache while waiting for the loader lock, with
+        // another thread holding the loader lock and waiting for the cache,
+        // hangs the process for good: it cannot even exit, since
+        // ExitProcess needs the loader lock as well.
+        //
         // System32 only: never pick up a same-named DLL from the current folder or PATH.
         // SAFETY: NUL-terminated DLL name; only allow-listed system DLLs get here.
         let handle = unsafe {
@@ -136,7 +146,101 @@ mod imp {
                 LOAD_LIBRARY_SEARCH_SYSTEM32,
             )
         } as usize;
-        (handle != 0).then(|| *cache.entry(key).or_insert(handle))
+        // A thread that loaded the same DLL meanwhile got the same module
+        // (the OS counts the references), and it stays loaded either way, so
+        // whichever handle the map already holds is the right one.
+        (handle != 0).then(|| *cache().entry(key).or_insert(handle))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::ffi::c_void;
+        use std::ptr::{null, null_mut};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        use windows_sys::Win32::System::Threading::{
+            CreateThread, INFINITE, Sleep, WaitForSingleObject,
+        };
+
+        const CHILD: &str = "VICTORY_HOST_LOCK_CHILD";
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        static IN_ATTACH: AtomicBool = AtomicBool::new(false);
+        static STARTED: AtomicBool = AtomicBool::new(false);
+
+        /// Runs where a title's TLS callbacks run: under the loader lock, as
+        /// a new thread starts.
+        #[used]
+        #[unsafe(link_section = ".CRT$XLY")]
+        static ON_THREAD: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = attach;
+
+        unsafe extern "system" fn attach(_: *mut c_void, reason: u32, _: *mut c_void) {
+            const DLL_THREAD_ATTACH: u32 = 2;
+            if reason == DLL_THREAD_ATTACH && ARMED.swap(false, Ordering::SeqCst) {
+                IN_ATTACH.store(true, Ordering::SeqCst);
+                // SAFETY: a plain sleep, long enough for the other thread to
+                // start its load while this one holds the loader lock.
+                unsafe { Sleep(500) };
+                assert!(super::super::function("kernel32.dll", "GetTickCount").is_some());
+            }
+        }
+
+        unsafe extern "system" fn idle(_: *mut c_void) -> u32 {
+            0
+        }
+
+        /// One thread loads a DLL nothing has loaded yet, which needs the
+        /// loader lock, while another thread's attach holds that lock and
+        /// looks a function up. Run in a child process of the test binary: a
+        /// deadlock inside the loader keeps a process from exiting at all,
+        /// so the parent has to kill it rather than wait.
+        #[test]
+        fn loading_a_host_dll_does_not_block_a_thread_attach() {
+            if std::env::var_os(CHILD).is_none() {
+                let name = "host::imp::tests::loading_a_host_dll_does_not_block_a_thread_attach";
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", name])
+                    .env(CHILD, "1")
+                    .spawn()
+                    .unwrap();
+                let start = Instant::now();
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        assert!(status.success());
+                        return;
+                    }
+                    if start.elapsed() > Duration::from_secs(30) {
+                        child.kill().unwrap();
+                        panic!("deadlock: a host DLL loads under the module cache's lock");
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            // Cached first, so the attach below needs the cache only and no
+            // load of its own.
+            assert!(super::super::function("kernel32.dll", "GetTickCount").is_some());
+            let loader = std::thread::spawn(|| {
+                STARTED.store(true, Ordering::SeqCst);
+                while !IN_ATTACH.load(Ordering::SeqCst) {
+                    std::hint::spin_loop();
+                }
+                super::super::function("cabinet.dll", "FDICreate")
+            });
+            // That thread's own attach is over, so the next one armed is the
+            // thread created below.
+            while !STARTED.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            ARMED.store(true, Ordering::SeqCst);
+            let (security, start) = (null(), Some(idle as _));
+            // SAFETY: a thread entry point of ours that returns at once, with
+            // no argument and the default stack.
+            let thread = unsafe { CreateThread(security, 0, start, null(), 0, null_mut()) };
+            assert!(!thread.is_null());
+            assert!(loader.join().unwrap().is_some());
+            // SAFETY: our own thread's handle, still open.
+            unsafe { WaitForSingleObject(thread, INFINITE) };
+        }
     }
 }
 
