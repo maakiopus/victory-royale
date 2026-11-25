@@ -24,10 +24,6 @@ fn workspace_root() -> PathBuf {
 /// for tests, so that it follows `CARGO_TARGET_DIR` like the rest of the
 /// build.
 fn build_probe() -> PathBuf {
-    // Under Proton the Windows test process cannot invoke the Linux Cargo.
-    if let Some(path) = std::env::var_os("VICTORY_HLE_PROBE") {
-        return PathBuf::from(path);
-    }
     let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
     let status = Command::new(env!("CARGO"))

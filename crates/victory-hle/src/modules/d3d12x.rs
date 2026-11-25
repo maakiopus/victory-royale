@@ -18,9 +18,10 @@ extern "system" fn create_device(
     out: *mut *const Object,
 ) -> HRESULT {
     #[cfg(windows)]
-    victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
-    #[cfg(windows)]
-    victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    {
+        victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
+        victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    }
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
@@ -50,6 +51,9 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(not(windows))]
     let _ = dir;
 }
+
+#[cfg(windows)]
+pub use victory_gpu::pipeline::{save_pipeline_cache, warm};
 
 pub(crate) fn module() -> HleModule {
     HleModule {

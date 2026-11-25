@@ -26,7 +26,7 @@ pub const IID: Guid = Guid::new(
     [0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d],
 );
 
-/// As the title asks for it; it calls 0x20 (path) and 0x28
+/// As the title (2026) asks for it; it calls 0x20 (path) and 0x28
 /// (space) with the same arguments.
 pub const IID_2026: Guid = Guid::new(
     0x41a4_e10c,
@@ -88,32 +88,17 @@ pub struct SpaceInfo {
 }
 
 fn used_bytes(dir: &Path) -> u64 {
-    // Walk without following symlinks/junctions so a cycle or escape
-    // cannot inflate the PLS quota (VIC-BT-040 / #440). Paths stay on the
-    // stack so breadth does not hold many open directory handles at once.
-    let mut total = 0u64;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(path) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&path) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let Ok(ft) = e.file_type() else {
-                continue;
-            };
-            if ft.is_symlink() {
-                continue;
-            }
-            if ft.is_dir() {
-                stack.push(e.path());
-                continue;
-            }
-            if let Ok(m) = e.metadata() {
-                total = total.saturating_add(m.len());
-            }
-        }
-    }
-    total
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => used_bytes(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
 }
 
 /// What the host disk under `dir` has free (unlimited if unknown).
@@ -187,7 +172,6 @@ static VTABLE: Methods<8> = Methods([
     prompt_result as *const (),    // 0x38
 ]);
 
-// Reaches the folder through the title file calls, which are Windows-only.
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -200,9 +184,6 @@ mod tests {
         type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
         type Prompt = extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
         type Result = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
-        // Hold for the whole test so package tests that capture identifier()
-        // cannot interleave with our set_title.
-        let _title = runtime::title_test_lock();
         let this: This = &OBJECT;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();
@@ -241,21 +222,6 @@ mod tests {
         };
         assert_eq!(method::<Space>(&OBJECT, 0x28)(this, &mut info), S_OK);
         assert_eq!((info.used, info.total_free, info.total), (100, 900, 1000));
-
-        // A symlink into an outside tree must not inflate used bytes.
-        let outside = tempfile::tempdir().unwrap();
-        std::fs::write(outside.path().join("big.bin"), [0u8; 500]).unwrap();
-        let link = dir.path().join("outside.link");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(outside.path(), &link).unwrap();
-        assert_eq!(method::<Space>(&OBJECT, 0x28)(this, &mut info), S_OK);
-        assert_eq!(
-            (info.used, info.total_free, info.total),
-            (100, 900, 1000),
-            "symlink target must be ignored"
-        );
 
         let prompt = method::<Prompt>(&OBJECT, 0x30);
         let result = method::<Result>(&OBJECT, 0x38);

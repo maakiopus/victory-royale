@@ -2,19 +2,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use victory_core::diagnostics::{self, IoOperation};
 use victory_pe::implib::ImportLibrary;
 use victory_pe::{ImageInfo, layout};
 
 pub fn run(file: &Path, list_imports: bool, list_exports: bool) -> Result<()> {
-    let started = diagnostics::operation_started();
-    let data = std::fs::read(file)
-        .inspect_err(|error| IoOperation::InspectImage.failed(error, started))
-        .with_context(|| format!("reading {}", file.display()))?;
+    let data = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let info = ImageInfo::parse(&data).with_context(|| format!("parsing {}", file.display()))?;
 
     println!("file           {}", file.display());
-    println!("file size      {} bytes", data.len());
     println!("blake3         {}", blake3::hash(&data).to_hex());
     if let Some(cv) = &info.codeview {
         println!("pdb            {}  (key {})", cv.pdb_path, cv.symbol_key());

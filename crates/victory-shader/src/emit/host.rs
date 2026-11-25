@@ -62,69 +62,40 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
-fn pick_adapter(filter: Option<&str>) -> Result<IDXGIAdapter1, String> {
-    let needle = filter.map(|s| s.trim().to_ascii_lowercase());
-    // SAFETY: plain DXGI enumeration and D3D12 capability probe.
+/// Whether `device` is on the software adapter: the basic render driver's flag, or its vendor and device.
+fn software(device: &ID3D12Device) -> bool {
+    // SAFETY: a plain factory and adapter query for a live device.
     unsafe {
-        let factory: IDXGIFactory4 =
-            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-        let factory6 = factory.cast::<IDXGIFactory6>().ok();
-        let mut i = 0u32;
-        loop {
-            let adapter: IDXGIAdapter1 = match &factory6 {
-                Some(f6) => {
-                    match f6.EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) {
-                        Ok(a) => a,
-                        Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
-                        Err(e) => return Err(err(e)),
-                    }
-                }
-                None => match factory.EnumAdapters1(i) {
-                    Ok(a) => a,
-                    Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
-                    Err(e) => return Err(err(e)),
-                },
-            };
-            i += 1;
-            let desc = adapter.GetDesc1().map_err(err)?;
-            let is_sw = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
-            if let Some(ref want) = needle {
-                let len = desc
-                    .Description
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(desc.Description.len());
-                let name = String::from_utf16_lossy(&desc.Description[..len]).to_ascii_lowercase();
-                if !name.contains(want) {
-                    continue;
-                }
-            } else if is_sw {
-                continue;
-            }
-            if D3D12CreateDevice(
-                &adapter,
-                D3D_FEATURE_LEVEL_12_0,
-                std::ptr::null_mut::<Option<ID3D12Device>>(),
-            )
-            .is_ok()
-            {
-                return Ok(adapter);
-            }
-        }
-        Err(match filter {
-            Some(f) => format!("no D3D12 adapter matching VICTORY_ADAPTER={f:?}"),
-            None => "no hardware D3D12 adapter found".into(),
-        })
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return false;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())
+        else {
+            return false;
+        };
+        let Ok(desc) = adapter.GetDesc1() else {
+            return false;
+        };
+        desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
     }
 }
 
 impl Host {
-    /// The high-performance adapter (or `VICTORY_ADAPTER` substring match), or
-    /// WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
+            // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
+            // refused pipeline's error then carries.
+            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+                let mut debug: Option<ID3D12Debug> = None;
+                if D3D12GetDebugInterface(&mut debug).is_ok()
+                    && let Some(debug) = debug
+                {
+                    debug.EnableDebugLayer();
+                }
+            }
             let mut device: Option<ID3D12Device> = None;
             if warp {
                 let factory: IDXGIFactory4 =
@@ -132,19 +103,16 @@ impl Host {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                let filter = std::env::var("VICTORY_ADAPTER")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty());
-                match pick_adapter(filter.as_deref()) {
-                    Ok(adapter) => {
-                        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
-                            .map_err(err)?;
-                    }
-                    Err(e) if filter.is_some() => return Err(e),
-                    Err(_) => {
-                        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
-                            .map_err(err)?;
-                    }
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                // A machine without a graphics card gives the software
+                // adapter as its default device (a hosted test runner,
+                // whose first adapter is a display stub that cannot make a
+                // device): that is no hardware device, and the tests that
+                // ask for one skip it, as they do where there is none.
+                if let Some(made) = &device
+                    && software(made)
+                {
+                    return Err("the default device is the software adapter".to_owned());
                 }
             }
             let device = device.ok_or("no device")?;
@@ -166,6 +134,11 @@ impl Host {
             }
             Ok(Host { device })
         }
+    }
+
+    /// Whether the device is on the software adapter: asked of the device itself, the one a test runs on.
+    pub fn is_software(&self) -> bool {
+        software(&self.device)
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -202,8 +175,7 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        // Root views by slot: constant buffers (0), then raw buffers read
-        // (1), then raw buffers written (2).
+        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
         let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
@@ -214,41 +186,12 @@ impl Host {
             .collect();
         views.sort_unstable();
         views.dedup();
-        let uav_ranges: Vec<_> = views
-            .iter()
-            .filter(|(_, kind)| *kind == 2)
-            .map(|&(slot, _)| D3D12_DESCRIPTOR_RANGE1 {
-                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-                NumDescriptors: 1,
-                BaseShaderRegister: u32::from(slot),
-                RegisterSpace: super::ROOT_CBV_SPACE,
-                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                    | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                OffsetInDescriptorsFromTableStart: 0,
-            })
-            .collect();
-        let mut uav_ranges = uav_ranges.iter();
         for (slot, kind) in views {
-            // Match the runtime's bounded, single-view UAV table.
-            if kind == 2 {
-                let range = uav_ranges.next().expect("range for each root UAV");
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                            NumDescriptorRanges: 1,
-                            pDescriptorRanges: range,
-                        },
-                    },
-                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-                });
-                continue;
-            }
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if kind == 0 {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
+                ParameterType: match kind {
+                    1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    2 => D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    _ => D3D12_ROOT_PARAMETER_TYPE_CBV,
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
@@ -335,7 +278,37 @@ impl Host {
             ..Default::default()
         };
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
+    }
+
+    /// The error with the debug layer's messages since the last call, if
+    /// the layer is on (`VICTORY_D3D12_DEBUG`).
+    fn explained(&self, e: windows::core::Error) -> String {
+        let mut text = err(e);
+        let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
+            return text;
+        };
+        // SAFETY: each message is read into a buffer of the size the queue
+        // asks for, aligned for the message header.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut len = 0usize;
+                let _ = queue.GetMessage(i, None, &mut len);
+                let mut buffer = vec![0u64; len.div_ceil(8)];
+                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if queue.GetMessage(i, Some(message), &mut len).is_ok() {
+                    let m = &*message;
+                    let bytes = std::slice::from_raw_parts(
+                        m.pDescription,
+                        m.DescriptionByteLength.saturating_sub(1),
+                    );
+                    text.push_str(" | ");
+                    text.push_str(&String::from_utf8_lossy(bytes));
+                }
+            }
+            queue.ClearStoredMessages();
+        }
+        text
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -560,7 +533,9 @@ impl Host {
 }
 
 /// A pass-through position from the test draw's vertex buffer.
+// shortcut: kept for synthetic host-buffer tests; not every test target uses it.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn position_vs() -> HostShader {
     use super::lower;
     use crate::native::{HwStage, NativeProgram, StageIo, Usage, VsInput};
@@ -643,6 +618,7 @@ pub(super) fn position_vs() -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
     }
 }
 
@@ -736,6 +712,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
     }
 }
 
@@ -772,16 +749,6 @@ pub struct Draw<'a> {
     pub mesh_groups: u32,
 }
 
-/// Input command for the synthetic three-vertex render fixture.
-#[cfg(test)]
-#[derive(Clone, Copy)]
-pub(super) enum TriangleDraw {
-    Direct,
-    TwoTriangles,
-    Indexed,
-    IndirectIndexed,
-}
-
 #[cfg(test)]
 impl Host {
     /// Draws one triangle into an RGBA32F target and returns its texels.
@@ -790,16 +757,6 @@ impl Host {
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         d: &Draw,
-    ) -> Result<Vec<[f32; 4]>, String> {
-        self.draw_triangle(root, pso, d, TriangleDraw::Direct)
-    }
-
-    pub(super) fn draw_triangle(
-        &self,
-        root: &ID3D12RootSignature,
-        pso: &ID3D12PipelineState,
-        d: &Draw,
-        command: TriangleDraw,
     ) -> Result<Vec<[f32; 4]>, String> {
         let dev = &self.device;
         let (w, h) = d.size;
@@ -1037,61 +994,11 @@ impl Host {
                     }]),
                 );
             }
-            // An offset and negative base exercise the same addressing in both
-            // indexed calls. The indirect arguments follow the index data in the same buffer.
-            let mut signature: Option<ID3D12CommandSignature> = None;
-            if matches!(
-                command,
-                TriangleDraw::Indexed | TriangleDraw::IndirectIndexed
-            ) {
-                let words = [0u32, 2, 3, 4, 3, 1, 1, (-2i32) as u32, 0];
-                let bytes = std::mem::size_of_val(&words);
-                let buf = make(
-                    D3D12_HEAP_TYPE_UPLOAD,
-                    &buf_desc(bytes as u64),
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                )?;
-                let mut mapped = std::ptr::null_mut();
-                buf.Map(0, None, Some(&mut mapped)).map_err(err)?;
-                std::ptr::copy_nonoverlapping(words.as_ptr(), mapped.cast(), words.len());
-                buf.Unmap(0, None);
-                list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
-                    BufferLocation: buf.GetGPUVirtualAddress(),
-                    SizeInBytes: 16,
-                    Format: DXGI_FORMAT_R32_UINT,
-                }));
-                if matches!(command, TriangleDraw::IndirectIndexed) {
-                    let arg = D3D12_INDIRECT_ARGUMENT_DESC {
-                        Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
-                        ..Default::default()
-                    };
-                    dev.CreateCommandSignature(
-                        &D3D12_COMMAND_SIGNATURE_DESC {
-                            ByteStride: 20,
-                            NumArgumentDescs: 1,
-                            pArgumentDescs: &arg,
-                            NodeMask: 0,
-                        },
-                        None::<&ID3D12RootSignature>,
-                        &mut signature,
-                    )
-                    .map_err(err)?;
-                    list.ExecuteIndirect(signature.as_ref().unwrap(), 1, &buf, 16, None, 0);
-                } else {
-                    list.DrawIndexedInstanced(3, 1, 1, -2, 0);
-                }
-                keep.push(buf);
-            } else if d.mesh_groups > 0 {
+            if d.mesh_groups > 0 {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
-                let count = if matches!(command, TriangleDraw::TwoTriangles) {
-                    6
-                } else {
-                    3
-                };
-                list.DrawInstanced(count, 1, 0, 0);
+                list.DrawInstanced(3, 1, 0, 0);
             }
             list.ResourceBarrier(&[transition(
                 &target,
@@ -1188,8 +1095,8 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
-    /// An RGBA32F cube SRV (face size, mip count, texels by face then mip).
-    Cube(u32, u16, &'a [[f32; 4]]),
+    /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
+    Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1364,24 +1271,20 @@ impl Host {
                 at.ptr += i * view_size;
                 match *v {
                     View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces, levels) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1, 1),
-                            View::Cube(n, levels, t) => (n, n, t, 6, levels),
+                        let (w, h, texels, faces) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1),
+                            View::Cube(n, t) => (n, n, t, 6),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
-                        desc.MipLevels = levels;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        let mut start = 0;
-                        for sub in 0..faces * u32::from(levels) {
-                            let mip = sub % u32::from(levels);
-                            let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
-                            let pitch = (w as usize * 16).next_multiple_of(256);
+                        let pitch = (w as usize * 16).next_multiple_of(256);
+                        for face in 0..faces as usize {
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
                                 &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
@@ -1389,10 +1292,9 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let pixels = &texels[start..start + (w * h) as usize];
-                            start += pixels.len();
+                            let texels = &texels[face * (w * h) as usize..];
                             for y in 0..h as usize {
-                                let row = &pixels[y * w as usize..(y + 1) * w as usize];
+                                let row = &texels[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
                                     p.cast::<u8>().add(y * pitch),
@@ -1401,7 +1303,7 @@ impl Host {
                             }
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
-                            at_face.Anonymous.SubresourceIndex = sub;
+                            at_face.Anonymous.SubresourceIndex = face as u32;
                             list.CopyTextureRegion(
                                 &at_face,
                                 0,
@@ -1423,7 +1325,7 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: u32::from(levels),
+                                    MipLevels: 1,
                                     ..Default::default()
                                 },
                             },

@@ -4,10 +4,9 @@
 //! the import, then list it with `hle_export!` in the module's `module()`.
 //! Run `victory census` over your titles to see what is still missing.
 //!
-//! Package paths (`files`), store answers (`xstore`), and audio (`audio`,
-//! `dsp`, Windows `apu`) are implemented. shortcut: title-thread TLS
-//! callbacks and a full XAudio2 surface are still driven by census, not by
-//! completeness.
+//! Planned areas (driven by census results, not by completeness):
+//! `file` (package paths), `thread` (TLS callbacks for title threads),
+//! `xaudio2`, `xstore` stubs.
 
 #[cfg(windows)]
 pub mod apu;
@@ -15,12 +14,8 @@ pub mod audio;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
-/// Portable partitioned convolution for the Windows/Xbox audio DSP.
-pub(crate) mod dsp_convolve;
 #[cfg(windows)]
 pub mod dstorage;
-#[cfg(windows)]
-pub mod dualsense;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
@@ -31,8 +26,6 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
-/// Lexical Windows path rules, host-independent so CI covers them.
-pub(crate) mod paths;
 pub mod speech;
 pub mod storage;
 pub mod xasync;
@@ -49,22 +42,7 @@ pub mod xstore;
 pub mod xsystem;
 pub mod xuser;
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use crate::HleModule;
-
-/// Takes one reference off a COM count: the count left, or `None` when
-/// none was left (the title released once too often). Then the count
-/// stays 0 and the caller frees nothing a second time.
-pub(crate) fn release_ref(refs: &AtomicU32, object: &'static str) -> Option<u32> {
-    match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
-        Ok(n) => Some(n - 1),
-        Err(_) => {
-            tracing::warn!(object, "released with no references left");
-            None
-        }
-    }
-}
 
 pub(crate) fn all() -> Vec<HleModule> {
     let mut all = vec![

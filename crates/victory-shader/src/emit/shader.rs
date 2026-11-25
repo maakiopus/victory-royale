@@ -1,7 +1,6 @@
 //! A DXIL vertex, pixel, compute or mesh shader under construction: the module,
 //! the `dx.op` declarations it calls, its signatures and bound resources,
-//! and the metadata and container that wrap it up (SM 6.6; validator 1.6,
-//! or 1.8 for compute derivatives).
+//! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
@@ -14,13 +13,77 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 
+/// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
+/// reads buffers through descriptors it picks from the view heap at an
+/// index it computes (SM 6.6 dynamic resources): a raw buffer of
+/// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
+/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// The console's descriptor holds that stride and its hardware multiplies
+/// the element index by it; the program's code does not say it, and the
+/// used-resource list only names what tables hold. A shader that has this
+/// root SRV also tells the host that the buffer views of the whole heap
+/// must be ready when it runs, not only those its tables name.
+pub const SLOT_STRIDES: u8 = 255;
+/// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
+pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+
+/// Title memory by address (`resource::MEMORY`): console code reads and
+/// writes through raw 40-bit addresses it takes from root constants,
+/// descriptors and other memory (the ray-tracing structure builder and the
+/// programs that walk its structures). The host keeps copies of the title
+/// memory shaders use; a shader with such an access finds the copy by the
+/// address:
+///
+/// - the root SRV `t<SLOT_MEMORY>` in [`ROOT_CBV_SPACE`] is a directory of
+///   [`MEMORY_PAGES`] entries of two dwords, one per 64 KiB of title
+///   address space: the number of the host copy holding that page (0: none
+///   yet) and the page's byte offset in that copy;
+/// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
+///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
+///   reads zeros and drops writes;
+/// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
+///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
+///   host reads afterwards to make those copies for the frames to come.
+pub const SLOT_MEMORY: u8 = 254;
+/// See [`SLOT_MEMORY`].
+pub const SLOT_FAULTS: u8 = 253;
+/// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
+pub const MEMORY_PAGES: u32 = 1 << 21;
+/// Dwords of the [`SLOT_FAULTS`] buffer.
+pub const MEMORY_FAULTS: u32 = 4096;
+/// `RootType::Other` code of a user-data dword the host computes: the view
+/// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
+pub const USER_MEMORY_BASE: u32 = 0x100;
+/// `RootType::Other` code of a user-data dword the host computes: the low
+/// 32 bits of the title address of the buffer view at dword `dword` of the
+/// descriptor table of root parameter `slot`; [`USER_VIEW_ADDRESS`] + 1:
+/// its bits from 32 up. (Console code reads the address out of a buffer
+/// descriptor and uses it as a pointer.)
+pub const USER_VIEW_ADDRESS: u32 = 0x101;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// bytes (0 to 15) by which the raw view the host binds for the root view
+/// of root parameter `slot` begins before the title's address. A raw view
+/// begins on 16 bytes of its host buffer; the console's root views begin
+/// anywhere (the structure builder's counters sit at addresses ending in
+/// 4 and c). The shader adds the dword to every byte offset through that
+/// view. Asked for every root UAV, and for the root SRVs of programs with
+/// a spilled user-data table.
+pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host sets: the number of
+/// the first thread group in x. The console dispatches any number of groups
+/// in one dimension; the host at most 65,535, so a larger dispatch runs in
+/// parts, each with the groups before it here. Asked for by compute programs
+/// that are told the x number alone (the one-dimensional ones).
+pub const USER_GROUP_BASE: u32 = 0x104;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
-    pub const VIEWPORT_RT_INDEX: u64 = 1 << 9;
+    pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
@@ -49,20 +112,6 @@ pub(crate) struct Mesh {
     pub topology: u8,
 }
 
-impl Mesh {
-    pub(super) const MAX_OUTPUT_BYTES: u64 = 32_768;
-
-    /// DXIL charges for declared components and rounds each output count
-    /// up to a multiple of 32 independently of the signature packing.
-    pub(super) fn output_bytes(self, vertices: &[SigElement], primitives: &[SigElement]) -> u64 {
-        let bytes = |count: u32, elements: &[SigElement]| {
-            let components: u64 = elements.iter().map(|e| u64::from(e.cols)).sum();
-            u64::from(count).next_multiple_of(32) * 4 * components
-        };
-        bytes(self.max_vertices, vertices) + bytes(self.max_primitives, primitives)
-    }
-}
-
 /// What a geometry shader declares: triangles in, triangle strips out on
 /// stream 0, one instance.
 #[derive(Debug, Clone, Copy)]
@@ -70,18 +119,25 @@ pub(crate) struct Geometry {
     pub max_vertices: u32,
 }
 
+/// The null slot every host view heap keeps at its end (0: no limit). Shaders translated while
+/// it is set read that slot for any view index at or past it. A read past a heap's end is
+/// undefined: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
+/// larger) hung its GPU (GPU-based validation: "descriptor heap index out of bounds"), and AMD
+/// RDNA3 took a page fault and removed the device.
+static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
+pub fn set_view_heap_limit(null_slot: u32) {
+    VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) struct Shader {
     pub m: Module,
-    /// Test builds: typed loads assembled from a dword-aligned pair.
-    #[cfg(test)]
-    pub unaligned_typed_loads: u32,
-    /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
-    #[cfg(test)]
-    pub smem_buffer_bytes: Vec<u32>,
-    /// Test builds: indices into the address list of image instructions that
-    /// were read.
-    #[cfg(test)]
-    pub image_address_reads: Vec<usize>,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -90,6 +146,7 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// A geometry shader (the rectangle stage, `rect.rs`); `pixel` is false.
     pub geometry: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
@@ -101,19 +158,15 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
-    /// Root UAVs (raw buffers) read and written, likewise.
+    /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
-    /// Heap handles annotated as constant buffers.
-    pub cbuffer_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
-    /// Compute derivatives require validator 1.8 rather than 1.6 or 1.7.
-    compute_derivatives: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -141,12 +194,6 @@ impl Shader {
         let entry = m.new_block();
         Shader {
             m,
-            #[cfg(test)]
-            unaligned_typed_loads: 0,
-            #[cfg(test)]
-            smem_buffer_bytes: Vec::new(),
-            #[cfg(test)]
-            image_address_reads: Vec::new(),
             t: Types {
                 void,
                 i1,
@@ -172,10 +219,8 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
-            cbuffer_handles: 0,
             threads: None,
             wave_size: None,
-            compute_derivatives: false,
             lds_dwords: 0,
             lds: None,
             main,
@@ -205,12 +250,6 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        if self.threads.is_some()
-            && self.mesh.is_none()
-            && matches!(opcode, 53..=56 | 60 | 61 | 64 | 81)
-        {
-            self.compute_derivatives = true;
-        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -294,8 +333,8 @@ impl Shader {
         h
     }
 
-    /// The handle of the root UAV (a raw buffer the shader may write) of
-    /// root parameter `slot`: `u<slot>` in [`ROOT_CBV_SPACE`].
+    /// The handle of the root UAV (a raw buffer) of root parameter `slot`:
+    /// `u<slot>` in [`ROOT_CBV_SPACE`].
     pub fn root_uav_handle(&mut self, slot: u8) -> V {
         if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
             return h;
@@ -313,7 +352,6 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        // A raw buffer with unordered access.
         let h = self.annotate(block, h, 11 | 0x1000, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
@@ -362,12 +400,6 @@ impl Shader {
 
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
-    /// Indices at or past [`super::VIEW_HEAP_LIMIT`] /
-    /// [`super::SAMPLER_HEAP_LIMIT`] (garbage or negative values from
-    /// dropped passes) are clamped to slot 0, so `ResourceDescriptorHeap` /
-    /// `SamplerDescriptorHeap` reads never go far past any heap. The bound
-    /// is the largest heap, not the one bound: an index just past a smaller
-    /// heap's end still reads past it.
     pub fn heap_handle(
         &mut self,
         block: usize,
@@ -376,21 +408,49 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
+        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
+        let index = if !sampler && limit != 0 {
+            let null = self.m.i32(limit);
+            let i32t = self.t.i32;
+            let v = self.op(
+                block,
+                "binary.i32",
+                Attr::ReadNone,
+                i32t,
+                40,
+                &[index, null],
+            );
+            self.m.tag(v, super::bitcode::Tag::Clamp);
+            v
+        } else if sampler {
+            // A sampler heap has at most 2,048 samplers on any host: an
+            // index past that (a number read from memory the host has not
+            // got yet) stays inside the largest heap there is.
+            // shortcut: not the bound heap's own count, which a title
+            // heap smaller than 2,048 would need.
+            let last = self.m.i32(2047);
+            let i32t = self.t.i32;
+            let v = self.op(
+                block,
+                "binary.i32",
+                Attr::ReadNone,
+                i32t,
+                40,
+                &[index, last],
+            );
+            self.m.tag(v, super::bitcode::Tag::Clamp);
+            v
+        } else {
+            index
+        };
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {
             flags::RESOURCE_HEAP
         };
-        let limit = self.m.i32(if sampler {
-            super::SAMPLER_HEAP_LIMIT
-        } else {
-            super::VIEW_HEAP_LIMIT
-        });
-        let zero = self.m.i32(0);
-        let in_bounds = self.m.cmp(block, super::bitcode::pred::IULT, index, limit);
-        let index = self.m.select(block, in_bounds, index, zero);
         self.nonuniform_handles += u32::from(nonuniform);
-        self.cbuffer_handles += u32::from(props.0 == 13);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -401,26 +461,6 @@ impl Shader {
             &[index, s, n],
         );
         self.annotate(block, h, props.0, props.1)
-    }
-
-    /// Omit unread user semantics from a translated pixel shader so an upstream
-    /// mesh shader can spend its output budget on what the pixel shader reads.
-    pub(super) fn prune_pixel_inputs(&mut self) {
-        if !self.pixel || !self.inputs.iter().any(|e| e.kind == 0 && e.usage == 0) {
-            return;
-        }
-        let mut remap = std::collections::HashMap::new();
-        let mut next = 0u32;
-        for (index, element) in self.inputs.iter().enumerate() {
-            if element.kind != 0 || element.usage != 0 {
-                if index as u32 != next {
-                    remap.insert(self.m.i32(index as u32), self.m.i32(next));
-                }
-                next += 1;
-            }
-        }
-        self.m.remap_input_loads(&remap);
-        self.inputs.retain(|e| e.kind != 0 || e.usage != 0);
     }
 
     /// The finished container.
@@ -447,8 +487,6 @@ impl Shader {
                 }
             }
         }
-        container::separate_interpolation(&mut self.inputs);
-        container::separate_interpolation(&mut self.outputs);
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -555,8 +593,8 @@ impl Shader {
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
-                    // shape (11: a raw buffer), globally coherent, counter,
-                    // rasterizer ordered, extra.
+                    // shape (11: raw buffer), globally coherent, counter,
+                    // rasterizer ordered, no extra properties.
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
@@ -571,7 +609,6 @@ impl Shader {
                         None,
                     ];
                     list.push(Some(self.m.md_node(ops)));
-                    // PSV0 kind 7: a raw buffer with unordered access.
                     bindings.push(Binding {
                         kind: 7,
                         space: ROOT_CBV_SPACE,
@@ -674,15 +711,8 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
-        if self.threads.is_none()
-            && !self.pixel
-            && self.geometry.is_none()
-            && self.outputs.iter().any(|o| matches!(o.kind, 4 | 5))
-        {
-            self.flags |= flags::VIEWPORT_RT_INDEX;
-        }
-        // Entry properties: shader flags (tag 0), thread-group size (4),
-        // wave size (11).
+        // Entry properties: shader flags (tag 0), geometry state (1),
+        // thread-group size (4), wave size (11).
         let mut props = Vec::new();
         if self.flags != 0 {
             props.push(i32c(&mut self, 0));
@@ -742,11 +772,8 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        let val_minor = if self.compute_derivatives { 8 } else { 6 };
-        let val_minor = i32c(&mut self, val_minor);
-        let val_version = self.m.md_node(vec![Some(one), Some(val_minor)]);
-        self.m.named_md("dx.valver", vec![val_version]);
-        // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
+        self.m.named_md("dx.valver", vec![version]);
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
             _ if self.geometry.is_some() => ("gs", 2),
@@ -759,9 +786,8 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
-        // Compute lowering can generate unused register results that otherwise
-        // keep arithmetic and entire chains of merge values in the host module.
-        let bitcode = self.m.write(!graphics);
+        let bitcode = self.m.write();
+        super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
@@ -772,14 +798,14 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::DOUBLES != 0 {
+            features |= 0x1;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
-        }
-        if self.flags & flags::VIEWPORT_RT_INDEX != 0 {
-            features |= 0x2000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
@@ -787,11 +813,14 @@ impl Shader {
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
         }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
+        }
         if self.flags & flags::RESOURCE_HEAP != 0 {
-            features |= super::SFI0_RESOURCE_HEAP;
+            features |= 0x200_0000;
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
-            features |= super::SFI0_SAMPLER_HEAP;
+            features |= 0x400_0000;
         }
         if self.flags & flags::ATOMIC_TYPED64 != 0 {
             features |= 0x40_0000;
@@ -818,7 +847,6 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
-            validator18: self.compute_derivatives,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
@@ -864,7 +892,7 @@ impl Shader {
             };
             let ops = vec![
                 c32(self, id as u32),
-                Some(self.m.md_str(e.semantic_name())),
+                Some(self.m.md_str(&e.name)),
                 c8(self, e.comp),
                 c8(self, e.kind),
                 indices,
@@ -878,213 +906,5 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
-    }
-}
-
-#[cfg(all(test, windows))]
-mod tests {
-    use super::super::bitcode::Term;
-    use super::super::validator;
-    use super::*;
-
-    use crate::dxbc::{Container, FourCC};
-
-    fn element(name: &str, row: u32, col: u8, cols: u8) -> SigElement {
-        SigElement {
-            name: name.into(),
-            index: 0,
-            kind: 0,
-            comp: 9,
-            interp: 2,
-            row: Some(row),
-            col,
-            cols,
-            usage: 0,
-            half: false,
-        }
-    }
-
-    fn change_part(dxil: &[u8], part: FourCC, edit: impl FnOnce(&mut [u8])) -> Vec<u8> {
-        let c = Container::parse(dxil).unwrap();
-        let part = c.part(part).unwrap();
-        let start = part.offset + 8;
-        let mut changed = dxil.to_vec();
-        edit(&mut changed[start..start + part.data.len()]);
-        let digest = container::hash(&changed[20..]);
-        changed[4..20].copy_from_slice(&digest);
-        changed
-    }
-
-    #[test]
-    fn packed_signature_records_keep_metadata_order_even_for_unused_elements() {
-        let Some(mut validator) = validator::Validator::for_test() else {
-            return;
-        };
-        let mut shader = Shader::new(false);
-        // A packed element at w precedes an unread element at x, as it does
-        // in module metadata. The signature part must preserve that order.
-        let mut high = element("HIGH", 0, 3, 1);
-        high.usage = 1;
-        shader.outputs = vec![high, element("LOW", 0, 0, 1)];
-        shader.inputs = shader.outputs.clone();
-        for e in &mut shader.inputs {
-            e.interp = 0;
-        }
-        shader.m.terminate(shader.entry, Term::Ret);
-        let mut dxil = shader.finish();
-        for (part, label, unused) in [
-            (FourCC::ISG1, "Program Input Signature", 0),
-            (FourCC::OSG1, "Program Output Signature", 15),
-        ] {
-            let mut swapped = change_part(&dxil, part, |data| {
-                assert_eq!(data[8 + 24], 8);
-                assert_eq!(data[40 + 24], 1);
-                assert_eq!(data[40 + 25], unused);
-                data[8..72].rotate_left(32);
-            });
-            let error = validator.validate(&mut swapped).unwrap_err();
-            assert!(
-                error.contains(&format!("'{label}' does not match expected for module")),
-                "{error}"
-            );
-        }
-        validator.validate(&mut dxil).unwrap();
-    }
-
-    #[test]
-    fn system_value_names_match_in_vertex_and_primitive_signatures() {
-        let Some(mut validator) = validator::Validator::for_test() else {
-            return;
-        };
-        let mut vertex = Shader::new(false);
-        let mut viewport = element("sV_vIeWpOrTaRrAyInDeX", 0, 0, 1);
-        viewport.kind = 5;
-        viewport.comp = 5;
-        viewport.interp = 1;
-        viewport.usage = 1;
-        vertex.outputs.push(viewport.clone());
-        let zero = vertex.m.i32(0);
-        let col = vertex.m.i8(0);
-        vertex.op(
-            vertex.entry,
-            "storeOutput.i32",
-            Attr::NoUnwind,
-            vertex.t.void,
-            5,
-            &[zero, zero, col, zero],
-        );
-        vertex.m.terminate(vertex.entry, Term::Ret);
-        let mut dxil = vertex.finish();
-        let mut misnamed = change_part(&dxil, FourCC::OSG1, |data| {
-            let name = crate::dxbc::u32_at(data, 12).unwrap() as usize;
-            assert_eq!(&data[name..name + 22], b"SV_ViewportArrayIndex\0");
-            data[name] = b's';
-        });
-        let error = validator.validate(&mut misnamed).unwrap_err();
-        assert!(
-            error.contains("'Program Output Signature' does not match expected for module"),
-            "{error}"
-        );
-        validator.validate(&mut dxil).unwrap();
-
-        let mut mesh = empty_mesh(1, 1);
-        viewport.usage = 0;
-        mesh.prims.push(viewport);
-        let mut dxil = mesh.finish();
-        let c = Container::parse(&dxil).unwrap();
-        let psg = c.part(FourCC::PSG1).unwrap().data;
-        let name = crate::dxbc::u32_at(psg, 12).unwrap() as usize;
-        assert_eq!(&psg[name..], b"SV_ViewportArrayIndex\0");
-        validator.validate(&mut dxil).unwrap();
-    }
-
-    fn empty_mesh(max_vertices: u32, max_primitives: u32) -> Shader {
-        let mut s = Shader::new(false);
-        s.threads = Some([32, 1, 1]);
-        s.mesh = Some(Mesh {
-            max_vertices,
-            max_primitives,
-            topology: 2,
-        });
-        let zero = s.m.i32(0);
-        s.op(
-            s.entry,
-            "setMeshOutputCounts",
-            Attr::NoUnwind,
-            s.t.void,
-            168,
-            &[zero, zero],
-        );
-        s.m.terminate(s.entry, Term::Ret);
-        s
-    }
-
-    #[test]
-    fn mesh_output_price_counts_declared_components_and_rounds_each_count() {
-        let Some(mut validator) = validator::Validator::for_test() else {
-            return;
-        };
-        for (vertices, primitives, rows, cols, prim_rows, stride, expected_bytes) in [
-            (256, 0, 8, 4, 0, 2, 32_768),
-            (256, 0, 32, 1, 0, 1, 32_768),
-            (224, 1, 9, 4, 1, 1, 32_768),
-            (224, 33, 9, 4, 1, 1, 33_280),
-            (225, 0, 9, 4, 0, 1, 36_864),
-        ] {
-            let mut s = empty_mesh(vertices, primitives);
-            for row in 0..rows {
-                s.outputs.push(SigElement {
-                    index: row,
-                    ..element("VALUE", row * stride, 0, cols)
-                });
-            }
-            for row in 0..prim_rows {
-                s.prims.push(SigElement {
-                    index: row,
-                    interp: 1,
-                    ..element("PRIM", row, 0, 4)
-                });
-            }
-            assert_eq!(
-                s.mesh.unwrap().output_bytes(&s.outputs, &s.prims),
-                expected_bytes
-            );
-            let result = validator.validate(&mut s.finish());
-            if expected_bytes <= Mesh::MAX_OUTPUT_BYTES {
-                result.unwrap();
-            } else {
-                let error = result.unwrap_err();
-                assert!(
-                    error.contains("vertex plus primitive output size is greater than 32768"),
-                    "{error}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn compute_implicit_sample_validates() {
-        let mut s = Shader::new(false);
-        s.threads = Some([32, 1, 1]);
-        s.wave_size = Some(32);
-        s.samplers = 1;
-        let block = s.entry;
-        let index = s.m.i32(0);
-        let texture = s.heap_handle(block, index, false, false, (2, 1033));
-        let sampler = s.sampler_handle(block, 0);
-        let zero = s.m.f32(0);
-        let fu = s.m.undef(s.t.f32);
-        let iu = s.m.undef(s.t.i32);
-        let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
-        let ret = s.t.res_ret;
-        s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
-        s.m.terminate(block, Term::Ret);
-        let mut dxil = s.finish();
-        let path = validator::Validator::default_path();
-        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
-            return;
-        };
-        validator.validate(&mut dxil).unwrap();
     }
 }

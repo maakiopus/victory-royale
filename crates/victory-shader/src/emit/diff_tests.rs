@@ -3,9 +3,8 @@
 //! dispatched) on the host GPU with the same inputs.
 //!
 //! Needs `VICTORY_CONSOLE_DXC` (the console SDK's `dxc.exe`) and a PC
-//! `dxc.exe` (`VICTORY_PC_DXC`, then the newest Windows SDK's, then the
-//! sibling of `VICTORY_DXIL` for standalone DXC). Skipped without both
-//! compilers. Set `VICTORY_WARP=1` to draw on WARP.
+//! `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's); skipped
+//! without them. Set `VICTORY_WARP=1` to draw on WARP.
 
 use std::path::{Path, PathBuf};
 
@@ -14,278 +13,6 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::host::{Draw, Host, Root};
 use super::{HostShader, RootType, translate};
-
-#[test]
-fn packed_pixel_inputs_read_both_halves() {
-    use super::container::{SigElement, signature};
-    use super::valu_tests::{ONE_AT_A_TIME, backends};
-    use crate::dxbc::{Container, FourCC};
-    use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage, VsInput, VsOutput};
-
-    let element = |name: &str, index, kind, row, cols, comp, half| SigElement {
-        name: name.into(),
-        index,
-        kind,
-        comp,
-        interp: 0,
-        row: Some(row),
-        col: 0,
-        cols,
-        usage: (1 << cols) - 1,
-        half,
-    };
-    let emit = |stage, io, words: &[u32], ins: &[SigElement], outs: &[SigElement]| {
-        // The serializer writes host types. Mark the synthetic console's
-        // native 16-bit elements in the source signature, in register order.
-        let native_sig = |elements: &[SigElement], input| {
-            let mut sig = signature(elements, input);
-            for (row, e) in sig[8..].as_chunks_mut::<32>().0.iter_mut().zip(elements) {
-                if e.half {
-                    row[16] += 3;
-                }
-            }
-            sig
-        };
-        let isg = native_sig(ins, true);
-        let osg = native_sig(outs, false);
-        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg), (FourCC::OSG1, &osg)]);
-        let native = NativeProgram {
-            stage,
-            wave64: false,
-            vgprs: 12,
-            layout: vec![],
-            used: vec![],
-            io,
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
-        let st = crate::structure::structure(&p).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
-        let res = crate::resource::track(&p, &native.layout, stage, Some(&st)).unwrap();
-        super::emit(
-            &Container::parse(&bytes).unwrap(),
-            &native,
-            &p,
-            &st,
-            &io,
-            &res,
-        )
-        .unwrap()
-    };
-    let mut validator = super::validator::Validator::default_path()
-        .map(|path| super::validator::Validator::load(Some(&path)).unwrap());
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|err| err.into_inner());
-    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-
-    for (label, fp16, pack2, flat, comps, widths, payload, expected) in [
-        (
-            "packed float",
-            true,
-            true,
-            false,
-            [9, 9],
-            [3, 2],
-            [
-                f32::from_bits(0xC000_3C00),
-                f32::from_bits(0x4200),
-                f32::from_bits(0xC400_3800),
-            ],
-            [1.0, -2.0, 0.0, -4.0],
-        ),
-        (
-            "unpacked float",
-            true,
-            false,
-            false,
-            [9, 9],
-            [3, 0],
-            [1.0, -2.0, 0.5],
-            [1.0, 0.0, -2.0, 0.5],
-        ),
-        (
-            "packed integer",
-            true,
-            true,
-            true,
-            [5, 4],
-            [2, 2],
-            [
-                f32::from_bits(0xFEDC_1234),
-                f32::from_bits(0x8080_8001),
-                0.0,
-            ],
-            [4660.0, 65244.0, 32769.0, 32896.0],
-        ),
-        (
-            "raw dwords",
-            false,
-            false,
-            true,
-            [5, 5],
-            [2, 0],
-            [
-                f32::from_bits(0xFEDC_1234),
-                f32::from_bits(0x8080_8001),
-                0.0,
-            ],
-            [4660.0, 65244.0, 32769.0, 32896.0],
-        ),
-    ] {
-        let varying =
-            |i: usize, row| element("TEXCOORD", i as u32, 0, row, widths[i], comps[i], fp16);
-        let varyings: Vec<_> = (0..2)
-            .filter(|&i| widths[i] != 0)
-            .map(|i| varying(i, i as u32))
-            .collect();
-        let position = element("SV_Position", 0, 3, varyings.len() as u32, 4, 9, false);
-        let mut vs_out = varyings.clone();
-        vs_out.push(position);
-        let vs = emit(
-            HwStage::Vs,
-            StageIo::Vs {
-                inputs: [(0, 4, 15), (1, 8, 7)]
-                    .map(|(row, vgpr, mask)| VsInput {
-                        usage: Usage::Generic,
-                        row,
-                        vgpr,
-                        mask,
-                    })
-                    .to_vec(),
-                outputs: vec![VsOutput {
-                    usage: Usage::Generic,
-                    row: 0,
-                    param: 0,
-                    fp16,
-                    pack2,
-                }],
-            },
-            &[
-                0xF800_0207,
-                0x000A_0908, // exp param0 v8, v9, v10, off
-                0xF800_08CF,
-                0x0706_0504, // exp pos0 v4, v5, v6, v7 done
-                0xBF81_0000,
-            ],
-            &[
-                element("POSITION", 0, 0, 0, 4, 9, false),
-                element(
-                    "TEXCOORD",
-                    0,
-                    0,
-                    1,
-                    3,
-                    if fp16 && !pack2 { 9 } else { 5 },
-                    fp16 && !pack2,
-                ),
-            ],
-            &vs_out,
-        );
-
-        let mut words = Vec::new();
-        if flat {
-            words.extend([0xC812_0002, 0xC816_0102]); // mov p0 attr0.x/y to v4/v5
-            for (pair, src) in [4u8, 5].into_iter().enumerate() {
-                let lo = 2 * pair as u8;
-                let hi = lo + 1;
-                // Shift each half down, then export its unsigned bit pattern as float.
-                let shift = |opcode: u32, dst: u8, src: u8| {
-                    opcode << 25 | u32::from(dst) << 17 | u32::from(src) << 9 | 144
-                };
-                words.extend([
-                    shift(0x1A, lo, src),
-                    shift(0x16, lo, lo),
-                    shift(0x16, hi, src),
-                ]);
-                for reg in [lo, hi] {
-                    words.push(0x7E00_0D00 | u32::from(reg) << 17 | u32::from(reg));
-                }
-            }
-        } else {
-            let reads = if pack2 {
-                [(0, 0), (0, 1), (1, 1), (2, 1)]
-            } else {
-                [(0, 0), (0, 1), (1, 0), (2, 0)]
-            };
-            for (i, (channel, high)) in reads.into_iter().enumerate() {
-                let dst = 2 + i as u32;
-                let attr = channel << 6 | high << 8;
-                words.extend([
-                    0xD742_0000 | dst,
-                    0x0002_0000 | attr,
-                    0xD75A_0000 | dst,
-                    (256 + dst) << 18 | 0x0002_0200 | attr,
-                    0x7E00_1700 | dst << 17 | dst, // v_cvt_f32_f16
-                ]);
-            }
-        }
-        words.extend([
-            0xF800_180F,
-            if flat { 0x0302_0100 } else { 0x0504_0302 },
-            0xBF81_0000,
-        ]);
-        let ps = emit(
-            HwStage::Ps,
-            StageIo::Ps {
-                inputs: vec![PsInput {
-                    usage: Usage::Generic,
-                    row: 0,
-                    mask: 7,
-                    attr: 0,
-                    flat,
-                    fp16,
-                    pack2,
-                    row2: u8::from(pack2),
-                }],
-                input_addr: if flat { 0 } else { 2 },
-                db_shader_control: 0,
-                patches: vec![],
-            },
-            &words,
-            &varyings,
-            &[element("SV_Target", 0, 16, 0, 4, 9, false)],
-        );
-        if let Some(v) = &mut validator {
-            for shader in [&vs, &ps] {
-                v.validate(&mut shader.dxil.clone())
-                    .unwrap_or_else(|err| panic!("{label} {:?}: {err}", shader.stage));
-            }
-            eprintln!("{label}: dxil.dll accepted VS and PS");
-        }
-        let vertices: Vec<_> = [[-1.0, -1.0], [-1.0, 3.0], [3.0, -1.0]]
-            .into_iter()
-            .flat_map(|[x, y]| [x, y, 0.5, 1.0, payload[0], payload[1], payload[2]])
-            .collect();
-        for &(backend, warp) in backends(force_warp) {
-            let host = match Host::new(warp) {
-                Ok(host) => host,
-                Err(err) => {
-                    eprintln!("{backend}: skipped ({err})");
-                    continue;
-                }
-            };
-            let (root, pso) = host
-                .pipeline(&vs, &ps)
-                .unwrap_or_else(|err| panic!("{label} {backend}: {err}"));
-            let out = host
-                .draw(
-                    &root,
-                    &pso,
-                    &Draw {
-                        roots: vec![],
-                        textures: &[],
-                        samplers: &[],
-                        vertices: &vertices,
-                        stride: 28,
-                        size: (2, 2),
-                        mesh_groups: 0,
-                    },
-                )
-                .unwrap();
-            assert_eq!(out, [expected; 4], "{label} {backend}");
-            eprintln!("{label}: readback matched on {backend}");
-        }
-    }
-}
 
 const RS: &str = "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), \
                   RootConstants(num32BitConstants=4, b0), \
@@ -925,48 +652,12 @@ const MS_CASES: &[(&str, u32, &str)] = &[
 ];
 
 fn tools() -> Option<(PathBuf, PathBuf)> {
-    tools_in(Path::new(super::validator::SDK_BIN), |key| {
-        std::env::var_os(key).map(PathBuf::from)
-    })
-}
-
-fn tools_in(kits: &Path, env_path: impl Fn(&str) -> Option<PathBuf>) -> Option<(PathBuf, PathBuf)> {
-    let console = env_path("VICTORY_CONSOLE_DXC")?;
-    let pc = env_path("VICTORY_PC_DXC")
-        .or_else(|| super::validator::sdk_tool(kits, "dxc.exe"))
-        .or_else(|| env_path("VICTORY_DXIL").map(|dll| dll.with_file_name("dxc.exe")))?;
-    (console.exists() && pc.exists()).then_some((console, pc))
-}
-
-#[test]
-fn pc_compiler_prefers_sdk_and_supports_standalone_dxc() {
-    let dir = tempfile::tempdir().unwrap();
-    let kits = dir.path().join("bin");
-    let sdk = kits.join("10.0.26100.0").join("x64");
-    std::fs::create_dir_all(&sdk).unwrap();
-    let console = dir.path().join("console.exe");
-    let validator = dir.path().join("dxil.dll");
-    let explicit_pc = dir.path().join("dxc.exe");
-    let sdk_pc = sdk.join("dxc.exe");
-    for path in [&console, &validator, &explicit_pc, &sdk_pc] {
-        std::fs::write(path, []).unwrap();
-    }
-    let locate = |pc: Option<&PathBuf>| {
-        tools_in(&kits, |key| match key {
-            "VICTORY_CONSOLE_DXC" => Some(console.clone()),
-            "VICTORY_DXIL" => Some(validator.clone()),
-            "VICTORY_PC_DXC" => pc.cloned(),
-            _ => None,
-        })
+    let console = PathBuf::from(std::env::var_os("VICTORY_CONSOLE_DXC")?);
+    let pc = match std::env::var_os("VICTORY_PC_DXC") {
+        Some(p) => PathBuf::from(p),
+        None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
     };
-    assert_eq!(locate(None), Some((console.clone(), sdk_pc.clone())));
-    assert_eq!(locate(Some(&dir.path().join("missing.exe"))), None);
-    assert_eq!(
-        locate(Some(&explicit_pc)),
-        Some((console.clone(), explicit_pc.clone()))
-    );
-    std::fs::remove_file(sdk_pc).unwrap();
-    assert_eq!(locate(None), Some((console, explicit_pc)));
+    (console.exists() && pc.exists()).then_some((console, pc))
 }
 
 fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
@@ -1461,7 +1152,7 @@ fn translated_compute_matches_pc() {
             typed_view(DXGI_FORMAT_R8_UNORM, 1),
             typed_view(DXGI_FORMAT_R16_FLOAT, 2),
             typed_view(DXGI_FORMAT_R8G8B8A8_SNORM, 4),
-            View::Cube(4, 1, &cube_texels),
+            View::Cube(4, &cube_texels),
         ])
         .collect();
     let root_cbv = floats(64, -0.125);

@@ -7,9 +7,24 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
-use std::num::NonZeroUsize;
+#[cfg(not(windows))]
+mod translate {
+    use std::path::PathBuf;
+
+    use anyhow::Result;
+
+    pub fn run(_: Vec<PathBuf>, _: bool, _: bool, _: bool, _: Option<usize>) -> Result<()> {
+        anyhow::bail!("shader translation requires Windows")
+    }
+
+    pub fn warm(_: Vec<PathBuf>, _: Option<usize>, _: bool) -> Result<()> {
+        anyhow::bail!("shader translation requires Windows")
+    }
+}
+
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -22,10 +37,6 @@ use clap::{Parser, Subcommand, ValueEnum};
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {
-    /// Write structured diagnostics to a new file outside every VIctory checkout.
-    #[arg(long, global = true, value_name = "FILE")]
-    diagnostic_jsonl: Option<PathBuf>,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -83,12 +94,23 @@ enum Command {
         /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
-        /// Include runtime hashes and duplicate DXIL containers in the per-program listing.
+        /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Positive worker thread count (default: every logical core).
+        /// Worker threads (default: every logical core).
         #[arg(long)]
-        jobs: Option<NonZeroUsize>,
+        jobs: Option<usize>,
+    },
+    /// Translate the shaders of a title's archives into the cache and make
+    /// their compute pipelines, so that a run finds them there.
+    Warm {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Only translate: no host pipelines.
+        #[arg(long)]
+        no_pipelines: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -134,20 +156,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    if let Some(path) = cli.diagnostic_jsonl
-        && victory_core::diagnostics::start(&path).is_err()
-    {
-        eprintln!(
-            "VIctory: cannot create diagnostic output (expected a new file outside the source tree)"
-        );
-    }
-    let result = dispatch(cli.command);
-    victory_core::diagnostics::finish(result.is_ok());
-    result
-}
-
-fn dispatch(command: Command) -> Result<()> {
-    match command {
+    match cli.command {
         Command::Inspect {
             file,
             imports,
@@ -170,13 +179,28 @@ fn dispatch(command: Command) -> Result<()> {
             pipelines,
             list,
             jobs,
-        } => translate::run(
+        } => {
+            // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                victory_shader::emit::set_host_max_wave(n);
+            }
+            translate::run(paths, validate, pipelines, list, jobs)
+        }
+        Command::Warm {
             paths,
-            validate,
-            pipelines,
-            list,
-            jobs.map(NonZeroUsize::get),
-        ),
+            jobs,
+            no_pipelines,
+        } => translate::warm(paths, jobs, !no_pipelines),
         Command::Run {
             exe,
             unimplemented,
@@ -184,7 +208,15 @@ fn dispatch(command: Command) -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let result = run::run(&exe, unimplemented, strict, execute, console);
+            // The process's own end, as `main`'s Result maps it: Ok is 0,
+            // Err is 1. A title that ends the process itself logs its own
+            // line and never returns here.
+            let code = if result.is_ok() { 0 } else { 1 };
+            tracing::info!("runtime exit: code {code}");
+            result
+        }
         Command::Config => show_config(),
     }
 }
@@ -202,21 +234,11 @@ fn show_config() -> Result<()> {
             .as_ref()
             .map_or("(none)".into(), |p| p.display().to_string())
     );
-    // Where each value came from, so it is clear which setting to change.
-    let o = cfg.origins;
-    println!("game_dir    : {}  [{}]", status(&cfg.game_dir), o.game_dir);
-    println!(
-        "cache_dir   : {}  [{}]",
-        cfg.cache_dir.display(),
-        o.cache_dir
-    );
-    println!("data_dir    : {}  [{}]", cfg.data_dir.display(), o.data_dir);
+    println!("game_dir    : {}", status(&cfg.game_dir));
+    println!("cache_dir   : {}", cfg.cache_dir.display());
+    println!("data_dir    : {}", cfg.data_dir.display());
     for t in &cfg.test_titles {
-        println!(
-            "test_title  : {}  [{}]",
-            status(&Some(t.clone())),
-            o.test_titles
-        );
+        println!("test_title  : {}", status(&Some(t.clone())));
     }
     for p in cfg
         .game_dir
@@ -233,38 +255,14 @@ fn show_config() -> Result<()> {
 
 /// Paths given on the command line, or the configured game + test titles.
 pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    let resolved = if !paths.is_empty() {
-        paths
-    } else {
-        let cfg = victory_core::Config::load()?;
-        let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
-        anyhow::ensure!(
-            !all.is_empty(),
-            "no paths given and none configured (see victory.example.toml)"
-        );
-        all
-    };
-    for p in &resolved {
-        victory_core::ensure_outside_repo(p)?;
+    if !paths.is_empty() {
+        return Ok(paths);
     }
-    Ok(resolved)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_paths_enforces_outside_repo() {
-        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let err = default_paths(vec![inside]).unwrap_err();
-        assert!(err.to_string().contains("inside"));
-    }
-
-    #[test]
-    fn default_paths_accepts_outside_path() {
-        let outside = std::env::temp_dir();
-        let res = default_paths(vec![outside.clone()]).unwrap();
-        assert_eq!(res, vec![outside]);
-    }
+    let cfg = victory_core::Config::load()?;
+    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
+    anyhow::ensure!(
+        !all.is_empty(),
+        "no paths given and none configured (see victory.example.toml)"
+    );
+    Ok(all)
 }

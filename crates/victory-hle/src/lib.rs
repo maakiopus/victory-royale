@@ -11,9 +11,12 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
-// Off Windows only the portable parts are built (for their tests); the
-// helpers that only Windows modules call go unused.
-#![cfg_attr(not(windows), allow(dead_code, unused_variables, unused_mut))]
+// shortcut: most of this surface is wired only in the Windows build. The
+// Linux workspace tests still build the crate; keep those paths for Windows.
+#![cfg_attr(
+    not(windows),
+    allow(dead_code, unused_imports, unused_variables, unused_mut)
+)]
 
 mod host;
 pub mod modules;
@@ -86,6 +89,24 @@ mod tests {
             r.classify("XGameRuntime.dll", &name("XGameRuntimeInitialize")),
             Some(Provenance::Hle)
         );
+    }
+
+    /// A title's own end of the process resolves to our logging export,
+    /// never to the host's silent `ExitProcess`.
+    #[test]
+    fn exit_process_resolves_to_hle() {
+        let r = HleResolver::new(HostPolicy::default());
+        for dll in [
+            "kernel32.dll",
+            "kernelbase.dll",
+            "api-ms-win-core-processthreads-l1-1-0.dll",
+        ] {
+            assert_eq!(
+                r.classify(dll, &name("ExitProcess")),
+                Some(Provenance::Hle),
+                "{dll}"
+            );
+        }
     }
 
     #[test]

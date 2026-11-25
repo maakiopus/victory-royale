@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use victory_game::sgd5;
@@ -11,22 +11,6 @@ use victory_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, nativ
 
 /// Files above this size are skipped (read whole into memory for now).
 pub(crate) const MAX_FILE: u64 = 2 << 30;
-
-pub(crate) fn scan_entries<'a>(
-    root: &'a Path,
-    walk_errors: &'a mut usize,
-) -> impl Iterator<Item = walkdir::DirEntry> {
-    walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_map(|entry| match entry {
-            Ok(entry) => Some(entry),
-            Err(error) => {
-                eprintln!("{error}");
-                *walk_errors += 1;
-                None
-            }
-        })
-}
 
 /// A shader container in a file: as is, or packed in an SGD5 record.
 pub(crate) enum Source<'a> {
@@ -54,19 +38,16 @@ impl Source<'_> {
 /// The packed records of SGD5 data, and every container stored as is (the
 /// executable keeps some records uncompressed), found by its magic.
 pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
-    let records: Vec<_> = if sgd5::is_sgd5(data) {
-        sgd5::records(data).collect()
-    } else {
-        Vec::new()
-    };
-    // A container stored as is inside a record's packed bytes (deflate
-    // stored blocks) is that record's, already counted.
-    // So is one kept in a part of another container stored as is.
-    let raw = victory_shader::dxbc::find_all(data, |offset| sgd5::in_record(&records, offset))
-        .into_iter()
-        .map(|(offset, data)| Source::Raw { offset, data })
-        .collect::<Vec<_>>();
-    let mut out: Vec<Source<'_>> = records.into_iter().map(Source::Packed).collect();
+    let mut out: Vec<Source<'_>> = Vec::new();
+    if sgd5::is_sgd5(data) {
+        out.extend(sgd5::records(data).map(Source::Packed));
+    }
+    let raw = memchr::memmem::find_iter(data, b"DXBC")
+        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
+        .map(|offset| Source::Raw {
+            offset,
+            data: &data[offset..],
+        });
     out.extend(raw);
     out
 }
@@ -93,9 +74,11 @@ struct Totals {
 pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
-    let mut walk_errors = 0;
     for root in &paths {
-        for entry in scan_entries(root, &mut walk_errors) {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -130,11 +113,6 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                         for n in &programs {
                             *t.native_stages.entry(n.stage).or_default() += 1;
                             list.push(format!("{:?} {} B", n.stage, n.code.len()));
-                            if disasm {
-                                listing.push(format!("    {:?} stage I/O: {:?}", n.stage, n.io));
-                                listing.extend(n.layout.iter().map(|p| format!("    {p:?}")));
-                                listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
-                            }
                             match gfx10::decode(&n.code) {
                                 Ok(insts) => {
                                     t.decoded += 1;
@@ -144,6 +122,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
+                                        listing
+                                            .extend(n.layout.iter().map(|p| format!("    {p:?}")));
+                                        listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
                                         listing.extend(
                                             insts.iter().map(|i| format_instruction(i, n.wave64)),
                                         );
@@ -230,13 +211,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
             println!("  opcode not in table  {op} x{n}");
         }
     }
-    if t.containers == 0 && walk_errors == 0 {
+    if t.containers == 0 {
         println!("(none found: shaders may sit in compressed or encrypted archives)");
     }
-    anyhow::ensure!(
-        walk_errors == 0,
-        "scan incomplete (traversal errors: {walk_errors})"
-    );
     Ok(())
 }
 

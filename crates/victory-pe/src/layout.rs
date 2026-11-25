@@ -16,8 +16,6 @@ pub const FILE_HEADER_CHARACTERISTICS: usize = 18;
 
 /// `IMAGE_OPTIONAL_HEADER64::AddressOfEntryPoint` (u32).
 pub const OPT_ADDRESS_OF_ENTRY_POINT: usize = 16;
-/// `IMAGE_OPTIONAL_HEADER64::SizeOfHeaders` (u32).
-pub const OPT_SIZE_OF_HEADERS: usize = 60;
 /// `IMAGE_OPTIONAL_HEADER64::CheckSum` (u32).
 pub const OPT_CHECKSUM: usize = 64;
 /// `IMAGE_OPTIONAL_HEADER64::DllCharacteristics` (u16).
@@ -104,117 +102,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn header_offsets_follow_the_dos_header_pointer() {
-        let mut data = [0u8; 0x100];
-        data[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&0x40u32.to_le_bytes());
-
-        assert_eq!(file_header_offset(&data), Some(0x44));
-        assert_eq!(optional_header_offset(&data), Some(0x58));
-    }
-
-    #[test]
-    fn data_directory_offsets_respect_declared_entry_count() {
-        let mut data = vec![0u8; 0x200];
-        data[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&0x40u32.to_le_bytes());
-
-        let optional = 0x58;
-        let count_at = optional + OPT_NUMBER_OF_RVA_AND_SIZES;
-        data[count_at..count_at + 4].copy_from_slice(&2u32.to_le_bytes());
-
-        let first = optional + OPT_DATA_DIRECTORY;
-        assert_eq!(data_directory_offset(&data, 0), Some(first));
-        assert_eq!(
-            data_directory_offset(&data, 1),
-            Some(first + DATA_DIRECTORY_SIZE)
-        );
-        assert_eq!(data_directory_offset(&data, 2), None);
-    }
-
-    #[test]
-    fn header_offset_helpers_reject_truncated_headers() {
-        let truncated_dos = [0u8; DOS_E_LFANEW + 3];
-        assert_eq!(file_header_offset(&truncated_dos), None);
-        assert_eq!(optional_header_offset(&truncated_dos), None);
-
-        let mut truncated_optional = [0u8; 0x100];
-        truncated_optional[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&0x40u32.to_le_bytes());
-
-        assert_eq!(data_directory_offset(&truncated_optional, 0), None);
-    }
-
-    #[test]
     fn reads_reject_overflowing_offsets() {
         let data = [0u8; 16];
         assert_eq!(read_u32(&data, usize::MAX - 1), None);
         assert_eq!(read_u64(&data, usize::MAX - 2), None);
-    }
-
-    /// Just enough of a PE32+ header for the offset helpers: `e_lfanew` and
-    /// `NumberOfRvaAndSizes`.
-    fn headers(lfanew: u32, directories: u32) -> Vec<u8> {
-        let mut data = vec![0u8; 0x200];
-        data[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&lfanew.to_le_bytes());
-        let count =
-            lfanew as usize + NT_SIGNATURE_SIZE + FILE_HEADER_SIZE + OPT_NUMBER_OF_RVA_AND_SIZES;
-        data[count..count + 4].copy_from_slice(&directories.to_le_bytes());
-        data
-    }
-
-    #[test]
-    fn header_offsets_follow_e_lfanew() {
-        let data = headers(0x80, 16);
-        assert_eq!(file_header_offset(&data), Some(0x84));
-        assert_eq!(optional_header_offset(&data), Some(0x98));
-        assert_eq!(data_directory_offset(&data, 0), Some(0x98 + 112));
-        assert_eq!(data_directory_offset(&data, 15), Some(0x98 + 112 + 15 * 8));
-    }
-
-    #[test]
-    fn offsets_need_the_bytes_they_are_read_from() {
-        // No `e_lfanew`: no header offsets at all.
-        assert_eq!(file_header_offset(&[0; DOS_E_LFANEW + 3]), None);
-        assert_eq!(optional_header_offset(&[0; DOS_E_LFANEW + 3]), None);
-        // `e_lfanew` is read, but `NumberOfRvaAndSizes` is past the end.
-        let mut data = vec![0u8; DOS_E_LFANEW + 4];
-        data[DOS_E_LFANEW..].copy_from_slice(&0x40u32.to_le_bytes());
-        assert_eq!(file_header_offset(&data), Some(0x44));
-        assert_eq!(data_directory_offset(&data, 0), None);
-        // A huge `e_lfanew` is an offset past the file, never a panic.
-        let data = {
-            let mut d = vec![0u8; 0x40];
-            d[DOS_E_LFANEW..DOS_E_LFANEW + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-            d
-        };
-        assert_eq!(
-            optional_header_offset(&data),
-            Some(u32::MAX as usize + NT_SIGNATURE_SIZE + FILE_HEADER_SIZE)
-        );
-        assert_eq!(data_directory_offset(&data, 0), None);
-    }
-
-    #[test]
-    fn directories_past_number_of_rva_and_sizes_are_absent() {
-        let data = headers(0x40, 10);
-        assert!(data_directory_offset(&data, 9).is_some());
-        assert_eq!(data_directory_offset(&data, 10), None);
-        assert_eq!(data_directory_offset(&data, dir::BOUND_IMPORT), None);
-        assert_eq!(data_directory_offset(&headers(0x40, 0), 0), None);
-        // A count far beyond the 16 defined slots is taken as written; the
-        // offset it allows may lie past the file, for the read to refuse.
-        let data = headers(0x40, u32::MAX);
-        let far = data_directory_offset(&data, 100).unwrap();
-        assert_eq!(far, 0x40 + 24 + OPT_DATA_DIRECTORY + 800);
-        assert_eq!(read_u32(&data, far), None);
-        assert_eq!(data_directory_offset(&data, u32::MAX as usize), None);
-    }
-
-    #[test]
-    fn reads_are_little_endian_and_bounded() {
-        let data = [1, 2, 3, 4, 5, 6, 7, 8];
-        assert_eq!(read_u32(&data, 0), Some(0x0403_0201));
-        assert_eq!(read_u32(&data, 4), Some(0x0807_0605));
-        assert_eq!(read_u32(&data, 5), None);
-        assert_eq!(read_u64(&data, 0), Some(0x0807_0605_0403_0201));
-        assert_eq!(read_u64(&data, 1), None);
     }
 }

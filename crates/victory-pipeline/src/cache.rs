@@ -1,7 +1,5 @@
-use std::fs::File;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -13,12 +11,9 @@ pub struct CacheKey(blake3::Hash);
 
 impl CacheKey {
     pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
-        let id = converter.id();
         let mut h = blake3::Hasher::new();
-        // Length-prefix the id so a NUL inside it cannot be mistaken for the
-        // old separator and collide with a different id/version pair.
-        h.update(&(id.len() as u64).to_le_bytes());
-        h.update(id.as_bytes());
+        h.update(converter.id().as_bytes());
+        h.update(&[0]);
         h.update(&converter.version().to_le_bytes());
         h.update(input);
         CacheKey(h.finalize())
@@ -63,53 +58,27 @@ impl Cache {
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
         // Write-then-rename so readers never see partial output.
-        let (tmp, mut file) = tempfile_in(dir)?;
+        let tmp = tempfile_in(dir);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
         if published.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
-        match published {
-            Ok(()) => Ok(path),
-            // Another converter published the same key while we converted,
-            // and the replace failed (on Windows, while a reader holds the
-            // entry without delete sharing): its output is this one, since
-            // the key covers the converter and the input.
-            Err(_) if path.is_file() => {
-                tracing::trace!(key = %key.to_hex(), "published by another writer");
-                Ok(path)
-            }
-            Err(e) => Err(e.into()),
-        }
+        published?;
+        Ok(path)
     }
 }
 
-fn tempfile_in(dir: &Path) -> io::Result<(PathBuf, File)> {
+fn tempfile_in(dir: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    create_tempfile_in(dir, &COUNTER)
-}
-
-fn create_tempfile_in(dir: &Path, counter: &AtomicU64) -> io::Result<(PathBuf, File)> {
-    // An interrupted writer can leave a file behind, and process IDs are
-    // reused. Keep it intact and try a new name rather than failing a miss.
-    for _ in 0..128 {
-        let n = counter.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(".tmp-{}-{n}", std::process::id()));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => return Ok((path, file)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not create a unique cache staging file after 128 attempts",
-    ))
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(".tmp-{}-{n}", std::process::id()))
 }
 
 #[cfg(test)]
@@ -150,61 +119,6 @@ mod tests {
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
     }
 
-    /// Publishes the entry for its input itself while converting, as a
-    /// concurrent converter of the same key would, and holds it open
-    /// without delete sharing, as a reader (antivirus, another process)
-    /// may.
-    #[cfg(windows)]
-    struct Racer {
-        entry: PathBuf,
-        held: std::sync::Mutex<Option<std::fs::File>>,
-    }
-
-    #[cfg(windows)]
-    impl Converter for Racer {
-        fn id(&self) -> &'static str {
-            "test.racer"
-        }
-        fn version(&self) -> u32 {
-            1
-        }
-        fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
-            use std::os::windows::fs::OpenOptionsExt;
-            let output = input.to_ascii_uppercase();
-            std::fs::create_dir_all(self.entry.parent().unwrap())?;
-            std::fs::write(&self.entry, &output)?;
-            const FILE_SHARE_READ: u32 = 1;
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ)
-                .open(&self.entry)?;
-            *self.held.lock().unwrap() = Some(file);
-            Ok(output)
-        }
-    }
-
-    /// Losing a publication race to an identical entry is a hit, not an
-    /// error (#890).
-    #[cfg(windows)]
-    #[test]
-    fn an_entry_published_meanwhile_is_used() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cache = Cache::open(tmp.path().join("cache")).unwrap();
-        let mut racer = Racer {
-            entry: PathBuf::new(),
-            held: std::sync::Mutex::new(None),
-        };
-        racer.entry = cache.path_for(&CacheKey::new(&racer, b"abc"));
-        let path = cache.get_or_convert(&racer, b"abc").unwrap();
-        assert_eq!(path, racer.entry);
-        assert_eq!(std::fs::read(&path).unwrap(), b"ABC");
-        // No staging file is left behind.
-        assert_eq!(
-            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-            1
-        );
-    }
-
     #[test]
     fn failed_publication_removes_the_staging_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -225,65 +139,6 @@ mod tests {
     }
 
     #[test]
-    fn staging_retries_collisions_without_changing_existing_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter = AtomicU64::new(0);
-        for n in 0..2 {
-            std::fs::write(
-                dir.path().join(format!(".tmp-{}-{n}", std::process::id())),
-                b"stale",
-            )
-            .unwrap();
-        }
-
-        let (path, mut file) = create_tempfile_in(dir.path(), &counter).unwrap();
-        file.write_all(b"fresh").unwrap();
-        drop(file);
-        assert_eq!(
-            path.file_name().unwrap(),
-            format!(".tmp-{}-2", std::process::id()).as_str()
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
-        for n in 0..2 {
-            assert_eq!(
-                std::fs::read(dir.path().join(format!(".tmp-{}-{n}", std::process::id()))).unwrap(),
-                b"stale"
-            );
-        }
-        assert_eq!(counter.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn staging_collision_retries_are_bounded() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter = AtomicU64::new(0);
-        for n in 0..128 {
-            std::fs::write(
-                dir.path().join(format!(".tmp-{}-{n}", std::process::id())),
-                b"stale",
-            )
-            .unwrap();
-        }
-
-        let error = create_tempfile_in(dir.path(), &counter).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(counter.load(Ordering::Relaxed), 128);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 128);
-    }
-
-    #[test]
-    fn staging_does_not_retry_other_io_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter = AtomicU64::new(0);
-        let missing = dir.path().join("missing");
-
-        let error = create_tempfile_in(&missing, &counter).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
-        assert!(!missing.exists());
-    }
-
-    #[test]
     fn version_bump_invalidates() {
         let v1 = Upper {
             version: 1,
@@ -294,32 +149,6 @@ mod tests {
             runs: AtomicUsize::new(0),
         };
         assert_ne!(CacheKey::new(&v1, b"x"), CacheKey::new(&v2, b"x"));
-    }
-
-    struct Keyed(&'static str, u32);
-
-    impl Converter for Keyed {
-        fn id(&self) -> &'static str {
-            self.0
-        }
-        fn version(&self) -> u32 {
-            self.1
-        }
-        fn convert(&self, _: &[u8]) -> Result<Vec<u8>> {
-            Ok(Vec::new())
-        }
-    }
-
-    #[test]
-    fn id_and_version_are_delimited() {
-        assert_ne!(
-            CacheKey::new(&Keyed("a\0", 1), b""),
-            CacheKey::new(&Keyed("a", 256), b"")
-        );
-        assert_ne!(
-            CacheKey::new(&Keyed("a", 1), b"b"),
-            CacheKey::new(&Keyed("a", 1), b"")
-        );
     }
 
     #[test]

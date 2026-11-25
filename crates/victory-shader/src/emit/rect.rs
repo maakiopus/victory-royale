@@ -8,7 +8,10 @@
 //! arguments stay the title's, and each rectangle arrives here as one
 //! triangle.
 //!
-//! The corner can occur at any of the three input positions. It shares x with one of
+//! Which vertex is the corner between the other two varies:
+//! the title's full-screen rectangles come as top left, bottom left, bottom
+//! right (the second), its tiled lighting as top left, bottom left, top
+//! right (the first). The corner is the vertex that shares x with one of
 //! the others and y with the other; the fourth vertex lies opposite it,
 //! `a + b - corner` for the position and every float output. That holds
 //! for three vertices with one positive w (then it is the same in clip
@@ -408,6 +411,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
         };
         (
             host(crate::native::HwStage::Vs, vs),
@@ -423,24 +427,10 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn rectangles_are_drawn_whole() {
-        check_rectangle_draws(false);
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn rectangles_are_drawn_whole_on_warp() {
-        check_rectangle_draws(true);
-    }
-
-    #[cfg(windows)]
-    fn check_rectangle_draws(warp: bool) {
-        use super::super::host::{Draw, Host, TriangleDraw};
-        let host = match Host::new(warp) {
-            Ok(host) => host,
-            Err(reason) => {
-                eprintln!("rectangle readback skipped (warp={warp}): {reason}");
-                return;
-            }
+        use super::super::host::{Draw, Host};
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
         };
         let (vs, ps) = pass_through();
         if let Ok(mut v) = super::super::validator::Validator::load(
@@ -459,7 +449,7 @@ mod tests {
             ("corner third", [(-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]),
         ] {
             let vertices = corners.map(vertex).concat();
-            let draw = |gs: Option<&[u8]>, command, data: &[f32]| {
+            let draw = |gs: Option<&[u8]>| {
                 let pso = host
                     .pipeline_with_gs(&root, &vs.dxil, gs, &ps.dxil)
                     .unwrap();
@@ -467,32 +457,14 @@ mod tests {
                     roots: Vec::new(),
                     textures: &[],
                     samplers: &[],
-                    vertices: data,
+                    vertices: &vertices,
                     stride: 32,
                     size: (8, 8),
                     mesh_groups: 0,
                 };
-                host.draw_triangle(&root, &pso, &d, command).unwrap()
+                host.draw(&root, &pso, &d).unwrap()
             };
-            let reference = [
-                (-1.0, 1.0),
-                (-1.0, -1.0),
-                (1.0, -1.0),
-                (-1.0, 1.0),
-                (1.0, -1.0),
-                (1.0, 1.0),
-            ]
-            .map(vertex)
-            .concat();
-            let whole = draw(None, TriangleDraw::TwoTriangles, &reference);
-            assert_eq!(
-                draw(Some(&gs), TriangleDraw::Direct, &vertices),
-                whole,
-                "{name}"
-            );
-            for command in [TriangleDraw::Indexed, TriangleDraw::IndirectIndexed] {
-                assert_eq!(draw(Some(&gs), command, &vertices), whole, "{name}");
-            }
+            let whole = draw(Some(&gs[..]));
             for (i, texel) in whole.iter().enumerate() {
                 let (x, y) = ((i % 8) as f32, (i / 8) as f32);
                 let want = [(x + 0.5) / 4.0 - 1.0, 1.0 - (y + 0.5) / 4.0, 0.0, 1.0];
@@ -501,7 +473,7 @@ mod tests {
                     "{name}: texel {i} is {texel:?}, not {want:?}"
                 );
             }
-            let half = draw(None, TriangleDraw::Direct, &vertices);
+            let half = draw(None);
             let missing = half.iter().zip(&whole).filter(|(a, b)| a != b).count();
             assert!(
                 missing >= 24,

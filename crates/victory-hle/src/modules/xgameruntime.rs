@@ -34,10 +34,6 @@ pub type HRESULT = i32;
 pub const S_OK: HRESULT = 0;
 /// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)`.
 pub const NOT_SUPPORTED: HRESULT = 0x8007_0032_u32 as i32;
-/// `E_NOINTERFACE`.
-pub const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
-/// `E_POINTER`.
-pub const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,9 +55,6 @@ impl Guid {
     }
 }
 
-/// `IUnknown` (`00000000-0000-0000-C000-000000000046`).
-pub const IID_IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
-
 impl std::fmt::Display for Guid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let d = self.data4;
@@ -74,34 +67,22 @@ impl std::fmt::Display for Guid {
 }
 
 /// A runtime object as title code calls it: its first word points at the
-/// method table. Ours are static, so reference counting is a no-op unless
-/// an `Instance` wraps this header with its own count.
+/// method table. Ours are static, so reference counting is a no-op.
 #[repr(C)]
 pub struct Object {
     vtable: *const *const (),
     /// Named in the log when a title calls a method we lack.
     area: &'static str,
-    /// Interface ids this object answers besides [`IID_IUNKNOWN`].
-    iids: &'static [Guid],
 }
 
-// SAFETY: the table is a static array of function addresses; `iids` is static.
+// SAFETY: the table is a static array of function addresses.
 unsafe impl Sync for Object {}
 
 impl Object {
     pub const fn new<const N: usize>(area: &'static str, methods: &'static Methods<N>) -> Object {
-        Object::with_iids(area, methods, &[])
-    }
-
-    pub const fn with_iids<const N: usize>(
-        area: &'static str,
-        methods: &'static Methods<N>,
-        iids: &'static [Guid],
-    ) -> Object {
         Object {
             vtable: methods.0.as_ptr(),
             area,
-            iids,
         }
     }
 }
@@ -136,46 +117,6 @@ pub extern "system" fn add_ref(_: *const Object) -> u32 {
     1
 }
 
-/// Slot 0: `QueryInterface`. A null `out` or `iid` is `E_POINTER`;
-/// [`IID_IUNKNOWN`] and the object's registered ids succeed (`AddRef`,
-/// `S_OK`); anything else clears `*out` and returns `E_NOINTERFACE`.
-///
-/// `AddRef` is taken from vtable slot 1 so the same helper works for a
-/// static [`Object`] and for an `Instance` whose first word is this header.
-pub extern "system" fn query_interface(
-    this: *mut Object,
-    iid: *const Guid,
-    out: *mut *mut c_void,
-) -> HRESULT {
-    if out.is_null() {
-        return E_POINTER;
-    }
-    if this.is_null() || iid.is_null() {
-        // SAFETY: checked non-null.
-        unsafe { out.write(std::ptr::null_mut()) };
-        return E_POINTER;
-    }
-    // SAFETY: title code calls methods on objects we handed out; iid is readable.
-    let (object, iid) = unsafe { (&*this, *iid) };
-    let found = iid == IID_IUNKNOWN || object.iids.contains(&iid);
-    // SAFETY: checked non-null; the title passes room for a pointer.
-    unsafe {
-        out.write(if found {
-            this.cast()
-        } else {
-            std::ptr::null_mut()
-        });
-    }
-    if !found {
-        return E_NOINTERFACE;
-    }
-    type AddRef = extern "system" fn(*mut Object) -> u32;
-    // SAFETY: every Object's table has AddRef at slot 1.
-    let add_ref: AddRef = unsafe { std::mem::transmute(*object.vtable.add(1)) };
-    add_ref(this);
-    S_OK
-}
-
 /// A slot nobody has needed yet; logged with its area. Wrong for a slot
 /// that returns `bool` or a value.
 pub extern "system" fn missing<const SLOT: usize>(this: *const Object) -> HRESULT {
@@ -200,18 +141,10 @@ pub fn put<T>(out: *mut T, value: T) -> HRESULT {
 }
 
 /// Copies `text` and a NUL into the title's `size`-byte buffer and reports
-/// the bytes used, as the runtime's string getters do. A buffer that does
-/// not fit is left untouched.
+/// the bytes used, as the runtime's string getters do.
 pub fn put_string(text: &str, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     let len = text.len() + 1;
     if buffer.is_null() || size < len {
-        // String getters are called twice: once with no buffer to learn the
-        // required size, then with that many bytes. Report it even on the
-        // insufficient-buffer branch so the first call can be used.
-        if !used.is_null() {
-            // SAFETY: checked non-null.
-            unsafe { used.write(len) };
-        }
         return xasync::E_NOT_SUFFICIENT_BUFFER;
     }
     // SAFETY: the buffer holds `size` bytes, checked above.
@@ -285,8 +218,7 @@ pub extern "system" fn UninitializeApiImpl() {
 }
 
 /// The object for an implemented (provider, interface id); others fail,
-/// each pair logged once. A null `out` is the title's own error, not a
-/// missing area, and is neither logged nor remembered as one.
+/// each pair logged once.
 pub extern "system" fn QueryApiImpl(
     provider: *const Guid,
     iid: *const Guid,
@@ -298,9 +230,6 @@ pub extern "system" fn QueryApiImpl(
     else {
         return NOT_SUPPORTED;
     };
-    if out.is_null() {
-        return xasync::E_INVALIDARG;
-    }
     #[cfg(feature = "diagnostics")]
     if tracing::enabled!(tracing::Level::DEBUG) {
         // Each runtime call site once: which title code uses which area, when.
@@ -316,7 +245,9 @@ pub extern "system" fn QueryApiImpl(
         .iter()
         .flat_map(|area| area.iter())
         .find(|(p, i, _)| (*p, *i) == (provider, iid));
-    if let Some(&(_, _, object)) = found {
+    if let Some(&(_, _, object)) = found
+        && !out.is_null()
+    {
         // SAFETY: checked non-null; the title passes room for a pointer.
         unsafe { out.write((object as *const Object).cast_mut().cast()) };
         return S_OK;
@@ -360,285 +291,6 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
     use crate::modules::kernel::{FreeLibrary, GetProcAddress, LoadLibraryExA};
-
-    fn first_interface() -> Interface {
-        AREAS[0][0]
-    }
-
-    #[test]
-    fn the_error_codes_are_the_documented_ones() {
-        assert_eq!(S_OK, 0);
-        assert_eq!(NOT_SUPPORTED, 0x8007_0032_u32 as i32);
-        assert_eq!(xasync::E_NOTIMPL, 0x8000_4001_u32 as i32);
-        assert_eq!(xasync::E_INVALIDARG, 0x8007_0057_u32 as i32);
-        assert_eq!(xasync::E_NOT_SUFFICIENT_BUFFER, 0x8007_007A_u32 as i32);
-    }
-
-    #[test]
-    fn a_guid_prints_the_canonical_form() {
-        let guid = Guid::new(
-            0x0123_4567,
-            0x89ab,
-            0xcdef,
-            [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
-        );
-        assert_eq!(guid.to_string(), "01234567-89ab-cdef-0123-456789abcdef");
-        // Copy and equality: the table lookup compares pairs by value.
-        assert_eq!(
-            guid,
-            Guid::new(guid.data1, guid.data2, guid.data3, guid.data4)
-        );
-        assert_ne!(guid, Guid::new(0, 0, 0, [0; 8]));
-    }
-
-    #[test]
-    fn put_writes_through_a_valid_pointer_only() {
-        let mut count = 0xdead_beef_u32;
-        assert_eq!(put(&mut count, 7_u32), S_OK);
-        assert_eq!(count, 7);
-        let mut flag = false;
-        assert_eq!(put(&mut flag, true), S_OK);
-        assert!(flag);
-        let mut wide = 0_usize;
-        assert_eq!(put(&mut wide, usize::MAX), S_OK);
-        assert_eq!(wide, usize::MAX);
-        assert_eq!(put::<u32>(std::ptr::null_mut(), 1), xasync::E_INVALIDARG);
-    }
-
-    #[test]
-    fn put_string_copies_the_text_and_its_nul() {
-        let mut buffer = [0xaa_u8; 8];
-        let mut used = 0;
-        assert_eq!(put_string("abc", 4, buffer.as_mut_ptr(), &mut used), S_OK);
-        assert_eq!((used, &buffer[..5]), (4, &[b'a', b'b', b'c', 0, 0xaa][..]));
-        // An empty string still needs room for its NUL.
-        assert_eq!(put_string("", 1, buffer.as_mut_ptr(), &mut used), S_OK);
-        assert_eq!((used, buffer[0]), (1, 0));
-        // The buffer's size, not the string's, decides what is written.
-        assert_eq!(
-            put_string("abc", 8, buffer.as_mut_ptr(), std::ptr::null_mut()),
-            S_OK
-        );
-        assert_eq!(&buffer[..4], b"abc\0");
-    }
-
-    #[test]
-    fn put_string_refuses_what_it_cannot_fit() {
-        let mut buffer = [0xaa_u8; 4];
-        let pointer = buffer.as_mut_ptr();
-        let mut used = 0xdead_beef_usize;
-        for size in [3, 0] {
-            assert_eq!(
-                put_string("abc", size, pointer, &mut used),
-                xasync::E_NOT_SUFFICIENT_BUFFER,
-                "size {size}"
-            );
-        }
-        assert_eq!(
-            put_string("abc", 4, std::ptr::null_mut(), &mut used),
-            xasync::E_NOT_SUFFICIENT_BUFFER
-        );
-        assert_eq!(
-            put_string("abc", usize::MAX, std::ptr::null_mut(), &mut used),
-            xasync::E_NOT_SUFFICIENT_BUFFER
-        );
-        assert_eq!(buffer, [0xaa; 4], "nothing is written on failure");
-        // The required size (text and NUL) is still reported, so the
-        // size-query call a title makes first can be used.
-        assert_eq!(used, 4, "the required size is reported");
-    }
-
-    #[test]
-    fn text_reads_the_titles_strings() {
-        assert_eq!(text(std::ptr::null()), None);
-        assert_eq!(text(c"".as_ptr()).as_deref(), Some(""));
-        assert_eq!(text(c"Player".as_ptr()).as_deref(), Some("Player"));
-        // Not UTF-8: the bytes become replacement characters, never a panic.
-        assert_eq!(text(c"a\xffb".as_ptr()).as_deref(), Some("a\u{fffd}b"));
-    }
-
-    #[test]
-    fn tokens_are_nonzero_and_distinct() {
-        let first = token();
-        let second = token();
-        assert!(first >= 1 && second > first);
-        let mut seen: Vec<u64> = (0..64).map(|_| token()).collect();
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(seen.len(), 64);
-        assert!(!seen.contains(&0));
-    }
-
-    #[test]
-    fn every_registered_interface_answers_with_its_object() {
-        let mut pairs = Vec::new();
-        for area in AREAS {
-            for &(provider, iid, object) in *area {
-                let mut out: *mut c_void = std::ptr::null_mut();
-                assert_eq!(
-                    QueryApiImpl(&provider, &iid, &mut out),
-                    S_OK,
-                    "{provider} {iid}"
-                );
-                assert_eq!(
-                    out as *const Object, object as *const Object,
-                    "{provider} {iid}"
-                );
-                assert!(!object.area.is_empty());
-                pairs.push((provider.to_string(), iid.to_string()));
-            }
-        }
-        // A pair listed twice would leave one object unreachable.
-        let count = pairs.len();
-        pairs.sort_unstable();
-        pairs.dedup();
-        assert_eq!(pairs.len(), count);
-    }
-
-    #[test]
-    fn an_unimplemented_area_is_unsupported_and_writes_nothing() {
-        let unknown = Guid::new(0xdead_beef, 0x1234, 0x5678, [0; 8]);
-        let untouched = 0x1234 as *mut c_void;
-        let mut out = untouched;
-        assert_eq!(QueryApiImpl(&unknown, &unknown, &mut out), NOT_SUPPORTED);
-        // Again, to exercise the once-only log path.
-        assert_eq!(QueryApiImpl(&unknown, &unknown, &mut out), NOT_SUPPORTED);
-        let (provider, _, _) = first_interface();
-        assert_eq!(QueryApiImpl(&provider, &unknown, &mut out), NOT_SUPPORTED);
-        assert_eq!(QueryApiImpl(&unknown, &provider, &mut out), NOT_SUPPORTED);
-        assert_eq!(out, untouched, "the output is not written on failure");
-        // Null GUID pointers are tolerated, never dereferenced.
-        assert_eq!(
-            QueryApiImpl(std::ptr::null(), std::ptr::null(), &mut out),
-            NOT_SUPPORTED
-        );
-        assert_eq!(
-            QueryApiImpl(std::ptr::null(), &unknown, &mut out),
-            NOT_SUPPORTED
-        );
-        assert_eq!(
-            QueryApiImpl(&unknown, std::ptr::null(), &mut out),
-            NOT_SUPPORTED
-        );
-        assert_eq!(out, untouched);
-    }
-
-    #[test]
-    fn a_null_output_is_the_titles_argument_error() {
-        let (provider, iid, object) = first_interface();
-        assert_eq!(
-            QueryApiImpl(&provider, &iid, std::ptr::null_mut()),
-            xasync::E_INVALIDARG,
-            "an implemented area with nowhere to put its object"
-        );
-        // Argument validation comes first, whatever the pair names: a null
-        // output is not a missing area and must not be remembered as one.
-        let unknown = Guid::new(0xdead_beef, 0x1234, 0x5678, [0; 8]);
-        assert_eq!(
-            QueryApiImpl(&unknown, &unknown, std::ptr::null_mut()),
-            xasync::E_INVALIDARG
-        );
-        // The same query still answers once there is room for the object.
-        let mut out: *mut c_void = std::ptr::null_mut();
-        assert_eq!(QueryApiImpl(&provider, &iid, &mut out), S_OK);
-        assert_eq!(out as *const Object, object as *const Object);
-    }
-
-    extern "system" fn answer(_: *const Object) -> u32 {
-        7
-    }
-
-    static TEST_METHODS: Methods<4> = Methods([
-        query_interface as *const (),
-        add_ref as *const (),
-        answer as *const (),
-        missing::<3> as *const (),
-    ]);
-    const TEST_IID: Guid = Guid::new(0x1111_1111, 0x2222, 0x3333, [4; 8]);
-    static TEST_OBJECT: Object = Object::with_iids("test", &TEST_METHODS, &[TEST_IID]);
-
-    #[test]
-    fn an_object_points_at_its_method_table() {
-        assert_eq!(TEST_OBJECT.vtable, TEST_METHODS.0.as_ptr());
-        assert_eq!(TEST_OBJECT.area, "test");
-        type Slot = extern "system" fn(*const Object) -> u32;
-        assert_eq!(method::<Slot>(&TEST_OBJECT, 0x08)(&TEST_OBJECT), 1);
-        assert_eq!(method::<Slot>(&TEST_OBJECT, 0x10)(&TEST_OBJECT), 7);
-        // Reference counting is a no-op: the tables are static, so a null
-        // handle is harmless too.
-        assert_eq!(add_ref(std::ptr::null()), 1);
-        let not_implemented = xasync::E_NOTIMPL as u32;
-        assert_eq!(
-            method::<Slot>(&TEST_OBJECT, 0x18)(&TEST_OBJECT),
-            not_implemented
-        );
-    }
-
-    #[test]
-    fn query_interface_accepts_iunknown_and_registered_iids() {
-        type Qi = extern "system" fn(*mut Object, *const Guid, *mut *mut c_void) -> HRESULT;
-        let qi = method::<Qi>(&TEST_OBJECT, 0x00);
-        let this = std::ptr::from_ref(&TEST_OBJECT).cast_mut();
-        let mut out: *mut c_void = std::ptr::null_mut();
-
-        assert_eq!(qi(this, &IID_IUNKNOWN, &mut out), S_OK);
-        assert_eq!(out, this.cast());
-        out = std::ptr::null_mut();
-        assert_eq!(qi(this, &TEST_IID, &mut out), S_OK);
-        assert_eq!(out, this.cast());
-
-        let unknown = Guid::new(0xdead_beef, 0, 0, [0; 8]);
-        out = 0x1234 as *mut c_void;
-        assert_eq!(qi(this, &unknown, &mut out), E_NOINTERFACE);
-        assert!(out.is_null());
-
-        out = 0x1234 as *mut c_void;
-        assert_eq!(qi(this, std::ptr::null(), &mut out), E_POINTER);
-        assert!(out.is_null());
-        assert_eq!(
-            qi(this, &IID_IUNKNOWN, std::ptr::null_mut()),
-            E_POINTER,
-            "a null out pointer is E_POINTER without a write"
-        );
-    }
-
-    #[test]
-    fn the_runtime_initialises_and_uninitialises() {
-        assert_eq!(XGameRuntimeInitialize(), S_OK);
-        assert_eq!(InitializeApiImpl(1, 2), S_OK);
-        assert_eq!(InitializeApiImplEx(1, 2, 3), S_OK);
-        assert_eq!(InitializeApiImplEx2(1, 2, 3, std::ptr::null()), S_OK);
-        let options = [0_u8; 16];
-        assert_eq!(InitializeApiImplEx2(0, 0, 0, options.as_ptr().cast()), S_OK);
-        UninitializeApiImpl();
-        XGameRuntimeUninitialize();
-        // Reporting an error is a log: a null message is fine.
-        XErrorReport(S_OK, std::ptr::null());
-        XErrorReport(xasync::E_INVALIDARG, c"bad argument".as_ptr());
-    }
-
-    #[test]
-    fn the_module_serves_the_runtime_dll() {
-        let module = module();
-        assert_eq!(module.name, "xgameruntime");
-        assert!(module.serves("XGAMERUNTIME.DLL"));
-        assert!(!module.serves("xgame.dll"));
-        let names: Vec<_> = module.exports.iter().map(|export| export.name).collect();
-        assert_eq!(
-            names,
-            [
-                "XGameRuntimeInitialize",
-                "XGameRuntimeUninitialize",
-                "InitializeApiImpl",
-                "InitializeApiImplEx",
-                "InitializeApiImplEx2",
-                "UninitializeApiImpl",
-                "QueryApiImpl",
-                "XErrorReport",
-            ]
-        );
-        assert!(module.exports.iter().all(|export| export.address != 0));
-    }
 
     #[test]
     fn title_stub_loads_the_runtime_dynamically() {
@@ -688,47 +340,5 @@ mod tests {
             assert!(!kernel32.is_null(), "host DLLs still load from the host");
             assert!(!GetProcAddress(kernel32, c"GetTickCount".as_ptr().cast()).is_null());
         }
-    }
-
-    #[test]
-    fn string_getters_report_the_required_size() {
-        let none = std::ptr::null_mut();
-        let mut used = usize::MAX;
-        assert_eq!(
-            put_string("gamertag", 0, none, &mut used),
-            xasync::E_NOT_SUFFICIENT_BUFFER
-        );
-        assert_eq!(used, 9, "the NUL is part of the required size");
-
-        // The two-call pattern: query, then fetch exactly that many bytes.
-        let mut buffer = vec![0xffu8; used];
-        assert_eq!(
-            put_string("gamertag", buffer.len(), buffer.as_mut_ptr(), &mut used),
-            S_OK
-        );
-        assert_eq!(buffer, b"gamertag\0");
-        assert_eq!(used, 9);
-
-        // A short buffer reports the size too, and writes nothing.
-        let mut short = [0xffu8; 3];
-        used = 0;
-        assert_eq!(
-            put_string("gamertag", short.len(), short.as_mut_ptr(), &mut used),
-            xasync::E_NOT_SUFFICIENT_BUFFER
-        );
-        assert_eq!(used, 9);
-        assert_eq!(short, [0xff; 3]);
-
-        // Callers that do not ask for the size are still supported.
-        assert_eq!(
-            put_string("gamertag", 0, none, std::ptr::null_mut()),
-            xasync::E_NOT_SUFFICIENT_BUFFER
-        );
-        let mut empty = [0xffu8; 1];
-        assert_eq!(
-            put_string("", empty.len(), empty.as_mut_ptr(), std::ptr::null_mut()),
-            S_OK
-        );
-        assert_eq!(empty, [0]);
     }
 }

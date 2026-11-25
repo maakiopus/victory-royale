@@ -7,16 +7,30 @@
 
 use std::collections::HashMap;
 
+pub mod census;
 pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
+
+/// What the lowering made an instruction for, where it says so (counted by
+/// [`census`], nothing else reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tag {
+    /// The select that keeps a register's old value in lanes a guard masks.
+    Guard,
+    /// An index clamp the translation adds (the console has none).
+    Clamp,
+    /// The iteration counter and limit test the translation adds to a loop.
+    Counter,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeDef {
     Void,
     Int(u32),
     Float,
+    Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -210,6 +224,8 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// See [`Tag`]: by instruction.
+    tags: HashMap<u32, Tag>,
 }
 
 impl Module {
@@ -231,6 +247,9 @@ impl Module {
     }
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
+    }
+    pub fn double(&mut self) -> Ty {
+        self.ty(TypeDef::Double)
     }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
@@ -357,6 +376,16 @@ impl Module {
         g
     }
 
+    /// Notes what instruction `v` is for (see [`Tag`]); only when modules
+    /// are counted.
+    pub fn tag(&mut self, v: V, tag: Tag) {
+        if let V::Inst(i) = v
+            && census::enabled()
+        {
+            self.tags.insert(i, tag);
+        }
+    }
+
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
@@ -410,22 +439,6 @@ impl Module {
         };
         self.push(block, ty, Op::Extract(agg, index))
     }
-    pub(super) fn remap_input_loads(&mut self, ids: &HashMap<V, V>) {
-        if ids.is_empty() {
-            return;
-        }
-        for inst in &mut self.insts {
-            if let Op::Call(function, args) = &mut inst.op
-                && self.funcs[*function as usize]
-                    .name
-                    .starts_with("dx.op.loadInput.")
-                && let Some(&id) = ids.get(&args[1])
-            {
-                args[1] = id;
-            }
-        }
-    }
-
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
             panic!("call of a non-function")
@@ -504,30 +517,12 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
-        self.insts.iter().any(|inst| match &inst.op {
-            Op::Call(fid, args) => {
-                self.funcs[*fid as usize].name == name
-                    && matches!(
-                        args.first(),
-                        Some(V::Const(cid)) if matches!(self.consts[*cid as usize].1, Const::Int(n) if n == opcode)
-                    )
-            }
-            _ => false,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_cmp(&self, predicate: u8) -> bool {
-        self.insts
-            .iter()
-            .any(|inst| matches!(inst.op, Op::Cmp(p, _, _) if p == predicate))
-    }
-
-    /// Start from instructions that must execute and from externally used
-    /// values. The worklist keeps their operands, including loop-carried phis.
-    fn live(&self, omit_unused_math: bool) -> Vec<bool> {
+    /// The module as bitcode.
+    /// Which instructions are written: every body instruction, the branch
+    /// conditions, and whatever they read, transitively (a phi nothing reads
+    /// is dropped). A worklist visits each instruction once, so a long chain
+    /// of merges costs one pass, not one pass per merge.
+    fn live(&self) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
@@ -538,27 +533,8 @@ impl Module {
                 work.push(i);
             }
         };
-        for md in &self.mds {
-            if let MdDef::Value(_, v) = md {
-                mark(&mut live, &mut work, *v);
-            }
-        }
         for b in &self.blocks {
             for &i in &b.body {
-                let op = &self.insts[i as usize].op;
-                if omit_unused_math
-                    && matches!(
-                        op,
-                        Op::Bin(..)
-                            | Op::Cast(..)
-                            | Op::Cmp(..)
-                            | Op::Select(..)
-                            | Op::Extract(..)
-                            | Op::Gep(..)
-                    )
-                {
-                    continue;
-                }
                 mark(&mut live, &mut work, V::Inst(i));
             }
             if let Some(Term::CondBr(c, ..)) = b.term {
@@ -573,7 +549,7 @@ impl Module {
         live
     }
 
-    pub fn write(&self, omit_unused_math: bool) -> Vec<u8> {
+    pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -606,6 +582,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
@@ -705,8 +682,8 @@ impl Module {
         }
         w.exit();
 
-        let live = self.live(omit_unused_math);
-        let is_live = |i: &&u32| live[**i as usize];
+        // Phis nothing reads are left out (one register per phi makes many).
+        let live = self.live();
 
         // Blocks are laid out in reverse postorder, so every block follows
         // its forward predecessors (drivers take a branch to an earlier
@@ -772,7 +749,7 @@ impl Module {
         let mut ids = vec![u32::MAX; self.insts.len()];
         let mut next = base;
         for b in layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().chain(&b.body).filter(is_live) {
+            for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
                 if !self.is_void(self.insts[i as usize].ty) {
                     ids[i as usize] = next;
                     next += 1;
@@ -854,7 +831,7 @@ impl Module {
         // The operands of variable-length records, reused across them.
         let mut r: Vec<u64> = Vec::new();
         for b in layout.iter().map(|&b| &self.blocks[b]) {
-            for &i in b.phis.iter().chain(&b.body).filter(is_live) {
+            for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
                 let inst = &self.insts[i as usize];
                 let rel = |v: V| {
                     let a = abs(v);
@@ -1186,7 +1163,7 @@ mod tests {
     fn worklist_liveness_matches_passes() {
         for (regs, stages, read) in [(1, 0, 1), (1, 1, 1), (4, 3, 1), (8, 17, 3), (16, 40, 16)] {
             let m = synthetic(regs, stages, read);
-            let live = m.live(false);
+            let live = m.live();
             assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
         }
     }
@@ -1213,51 +1190,10 @@ mod tests {
             V::Inst(i) => i as usize,
             _ => unreachable!(),
         };
-        let live = m.live(false);
+        let live = m.live();
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
-    }
-
-    #[test]
-    fn compute_keeps_calls_and_memory_effects_with_their_operands() {
-        let mut m = Module::default();
-        let i32t = m.int(32);
-        let shared = m.global("shared", i32t, 3);
-        let fty = m.func_ty(i32t, vec![i32t]);
-        let f = m.function("test_call", fty, None, false);
-        let entry = m.new_block();
-        let x = m.load(entry, shared);
-        let two = m.i32(2);
-        let arg = m.bin(entry, Bin::Add, x, two);
-        let call = m.call(entry, f, vec![arg]);
-        let old = m.atomic(entry, Rmw::Add, shared, arg);
-        m.store(entry, shared, old);
-        let store = *m.blocks[entry].body.last().unwrap();
-        let unused = m.bin(entry, Bin::Mul, call, two);
-        let live = m.live(true);
-        let retained = |v| match v {
-            V::Inst(i) => live[i as usize],
-            _ => unreachable!(),
-        };
-        assert!([x, arg, call, old].into_iter().all(retained));
-        assert!(live[store as usize]);
-        assert!(!retained(unused));
-    }
-
-    #[test]
-    fn unused_arithmetic_can_release_a_loop_carried_phi() {
-        let m = synthetic(64, 64, 8);
-        let all = m.live(false);
-        let needed = m.live(true);
-        let removed_phis = m
-            .insts
-            .iter()
-            .enumerate()
-            .filter(|(i, inst)| all[*i] && !needed[*i] && matches!(inst.op, Op::Phi(_)))
-            .count();
-        assert!(removed_phis >= 56);
-        assert!(m.write(true).len() < m.write(false).len());
     }
 
     #[test]
@@ -1276,7 +1212,7 @@ mod tests {
             ((64, 64, 64), 38_916, 0x9586_730c_f953_4a45),
             ((128, 256, 32), 295_952, 0x89e5_de2d_64f0_8785),
         ] {
-            let bytes = synthetic(regs, stages, read).write(false);
+            let bytes = synthetic(regs, stages, read).write();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
     }
@@ -1286,11 +1222,11 @@ mod tests {
     fn bench_write() {
         for (regs, stages, read) in [(64, 64, 64), (128, 256, 32), (256, 512, 256)] {
             let m = synthetic(regs, stages, read);
-            let bytes = m.write(false);
+            let bytes = m.write();
             let runs = 5;
             let t = std::time::Instant::now();
             for _ in 0..runs {
-                std::hint::black_box(m.write(false));
+                std::hint::black_box(m.write());
             }
             let per = t.elapsed() / runs;
             println!(

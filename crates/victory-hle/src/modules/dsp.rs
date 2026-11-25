@@ -9,17 +9,17 @@
 //! the title checks it one block later and treats a late command as an
 //! overrun. Commands complete when submitted here.
 //!
-//! Convolution runs on the host with the console's partitioned
-//! frequency-domain impulse responses (see [`super::dsp_convolve`]), so
-//! reverb returns are wet. The FFT and IFFT stream transforms remain silent:
-//! their inputs and outputs are spectra, not audio a title can play.
+//! The transforms themselves are not computed: the hardware takes impulse
+//! responses already in its own partitioned frequency-domain layout, which
+//! is not known. Outputs are silence, so reverb returns are dry.
+// shortcut: no convolution or block transform; outputs are zeros. Needs the
+// coprocessor's impulse response and spectrum layouts to do better.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use super::dsp_convolve::Convolver;
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
@@ -28,11 +28,8 @@ const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
 const CONVOLUTION: u32 = 1;
-/// XDspActivationOptions: a per-channel IR and deinterleaved blocks both
-/// need a stereo stream; polar format is for FFT/IFFT only.
-const DEINTERLEAVED: u32 = 2;
-const STEREO_IR: u32 = 8;
-const STEREO_OPTIONS: u32 = STEREO_IR | DEINTERLEAVED;
+/// Option bits that need a stereo stream, and one convolution refuses.
+const STEREO_OPTIONS: u32 = 2 | 8;
 const NOT_FOR_CONVOLUTION: u32 = 4;
 
 pub struct Dsp {
@@ -65,9 +62,6 @@ pub struct Stream {
     frames: u32,
     channels: u32,
     status: Box<Status>,
-    /// `None` for the FFT/IFFT transforms, which we do not compute.
-    convolver: Option<Convolver>,
-    deinterleaved: bool,
 }
 
 /// One block of work.
@@ -130,9 +124,6 @@ fn valid(desc: &StreamDesc) -> bool {
         (1..=2).contains(&channels)
             && matches!(frames, 0x200 | 0x400)
             && options & NOT_FOR_CONVOLUTION == 0
-            // The console's IR is complex pairs, one filter block at least.
-            && !desc.ir.is_null()
-            && desc.ir_floats >= 2 * frames
     } else {
         channels == 1 && matches!(frames, 0x200 | 0x400 | 0x800)
     };
@@ -164,29 +155,6 @@ pub extern "system" fn XDspActivate(
         channels,
         "audio DSP stream activated"
     );
-    let convolver = if kind == CONVOLUTION {
-        // `ir_floats` is one channel's length; a stereo IR holds one per channel.
-        let stereo_ir = options & STEREO_IR != 0;
-        let len = desc.ir_floats as usize * if stereo_ir { channels as usize } else { 1 };
-        // SAFETY: `valid` checked the pointer; the title's IR holds `ir_floats`
-        // floats per IR channel and stays alive in title memory for the
-        // stream's lifetime (the console copies it here).
-        let ir = unsafe { std::slice::from_raw_parts(desc.ir, len) };
-        match Convolver::new(
-            ir,
-            desc.ir_floats as usize,
-            frames as usize,
-            channels as usize,
-            stereo_ir,
-        ) {
-            Some(convolver) => Some(convolver),
-            None => return E_INVALIDARG,
-        }
-    } else {
-        None
-    };
-    // Reserve the stream only once it can be made, so a refused activation
-    // does not hold a slot.
     {
         // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
         let dsp = unsafe { &*dsp };
@@ -206,8 +174,6 @@ pub extern "system" fn XDspActivate(
             reserved: 0,
             result: S_OK,
         }),
-        convolver,
-        deinterleaved: options & DEINTERLEAVED != 0,
     });
     // SAFETY: checked non-null.
     unsafe {
@@ -229,8 +195,7 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     S_OK
 }
 
-/// Completes the command at once. Convolution writes wet output; the FFT
-/// and IFFT transforms still return silence.
+/// Completes the command at once: its output block is silence.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
@@ -243,29 +208,8 @@ pub extern "system" fn XDspSubmitCommand(
     let (stream, command) = unsafe { (&mut *stream, &*command) };
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
-        let mut written = false;
-        if let Some(convolver) = &mut stream.convolver
-            && !command.input.is_null()
-        {
-            // SAFETY: the title's input and output buffers hold one block.
-            let (input, output) = unsafe {
-                (
-                    std::slice::from_raw_parts(command.input, samples),
-                    std::slice::from_raw_parts_mut(command.output, samples),
-                )
-            };
-            written = convolver.process(
-                input,
-                output,
-                command.gains,
-                stream.deinterleaved,
-                stream.deinterleaved,
-            );
-        }
-        if !written {
-            // SAFETY: the title's output buffer holds one block.
-            unsafe { std::ptr::write_bytes(command.output, 0, samples) };
-        }
+        // SAFETY: the title's output buffer holds one block of the stream.
+        unsafe { std::ptr::write_bytes(command.output, 0, samples) };
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
@@ -364,115 +308,6 @@ mod tests {
             XDspActivate(dsp, &transform, &mut status, &mut stream),
             S_OK
         );
-        assert_eq!(XDspDeactivate(stream), S_OK);
-        assert_eq!(XDspDisconnect(dsp), S_OK);
-    }
-
-    #[test]
-    fn a_stereo_ir_activates_and_frees_its_slot() {
-        const BLOCK: usize = 0x200;
-        let mut base = vec![0u8; 0x10_0000];
-        let mut dsp = std::ptr::null_mut();
-        assert_eq!(
-            XDspConnectWithMaximumStreamLimit(
-                base.as_mut_ptr().cast(),
-                0x10_0000,
-                24,
-                1,
-                2,
-                &mut dsp
-            ),
-            S_OK
-        );
-        // One unity impulse per channel; `ir_floats` is one channel's length.
-        let mut time = vec![0f32; BLOCK];
-        time[0] = 1.0;
-        let left = crate::modules::dsp_convolve::encode_ir(&time, BLOCK);
-        let mut ir = left.clone();
-        ir.extend_from_slice(&left);
-        let desc = StreamDesc {
-            kind: CONVOLUTION,
-            options: STEREO_IR,
-            frames: BLOCK as u32,
-            channels: 2,
-            ir_floats: left.len() as u32,
-            ir: ir.as_ptr(),
-        };
-        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
-        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
-        let input = vec![0.75f32; BLOCK * 2];
-        let mut output = vec![0f32; BLOCK * 2];
-        let command = Command {
-            gains: [1.0, 1.0],
-            input: input.as_ptr(),
-            output: output.as_mut_ptr(),
-            reserved: 0,
-        };
-        let mut ticket = 0;
-        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
-        for channel in 0..2 {
-            let energy: f32 = output
-                .iter()
-                .skip(channel)
-                .step_by(2)
-                .map(|s| s * s)
-                .sum::<f32>()
-                / BLOCK as f32;
-            assert!(energy > 0.5, "channel {channel} wet, energy {energy}");
-        }
-        assert_eq!(XDspDeactivate(stream), S_OK);
-        // The only slot is free again.
-        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
-        assert_eq!(XDspDeactivate(stream), S_OK);
-        assert_eq!(XDspDisconnect(dsp), S_OK);
-    }
-
-    #[test]
-    fn convolution_through_the_api_returns_wet_audio() {
-        const BLOCK: usize = 0x200;
-        let mut base = vec![0u8; 0x10_0000];
-        let mut dsp = std::ptr::null_mut();
-        assert_eq!(
-            XDspConnectWithMaximumStreamLimit(
-                base.as_mut_ptr().cast(),
-                0x10_0000,
-                24,
-                4,
-                2,
-                &mut dsp
-            ),
-            S_OK
-        );
-        // A unity impulse in the console's frequency-domain layout.
-        let mut time = vec![0f32; BLOCK];
-        time[0] = 1.0;
-        let ir = crate::modules::dsp_convolve::encode_ir(&time, BLOCK);
-        let desc = StreamDesc {
-            kind: CONVOLUTION,
-            options: 0,
-            frames: BLOCK as u32,
-            channels: 1,
-            ir_floats: ir.len() as u32,
-            ir: ir.as_ptr(),
-        };
-        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
-        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
-        let input = vec![0.75f32; BLOCK];
-        let mut output = vec![0f32; BLOCK];
-        let command = Command {
-            gains: [1.0, 1.0],
-            input: input.as_ptr(),
-            output: output.as_mut_ptr(),
-            reserved: 0,
-        };
-        let mut ticket = 0;
-        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
-        assert_eq!(ticket, 1);
-        // SAFETY: the stream's status block.
-        let (completed, result) = unsafe { ((*status).completed, (*status).result) };
-        assert_eq!((completed, result), (ticket, S_OK));
-        let energy: f32 = output.iter().map(|s| s * s).sum::<f32>() / BLOCK as f32;
-        assert!(energy > 0.5, "wet return, energy {energy}");
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
     }

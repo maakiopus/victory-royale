@@ -13,75 +13,6 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
-/// Dynamic descriptor reservations for one host heap. Lists hold their slots
-/// until their submissions finish. Between releases, free runs can only shrink.
-struct DynamicSlots {
-    taken: Vec<bool>,
-    cursor: usize,
-    /// No contiguous free range of this size or larger survived the last search.
-    first_miss: usize,
-}
-
-impl DynamicSlots {
-    fn new(capacity: usize) -> Self {
-        Self {
-            taken: vec![false; capacity],
-            cursor: 0,
-            first_miss: usize::MAX,
-        }
-    }
-
-    fn reserve(&mut self, n: usize) -> Option<usize> {
-        if n == 0 || n > self.taken.len() || n >= self.first_miss {
-            return None;
-        }
-        let Some(first) = find_free_run(&self.taken, self.cursor, n) else {
-            self.first_miss = n;
-            return None;
-        };
-        let end = first + n;
-        self.taken[first..end].fill(true);
-        self.cursor = if end == self.taken.len() { 0 } else { end };
-        Some(first)
-    }
-
-    fn release(&mut self, first: usize, n: usize) {
-        let end = first.saturating_add(n).min(self.taken.len());
-        if let Some(slots) = self.taken.get_mut(first..end)
-            && !slots.is_empty()
-        {
-            slots.fill(false);
-            self.first_miss = usize::MAX;
-        }
-    }
-}
-
-/// The first index of `n` (non-zero) consecutive free slots in `taken`,
-/// searching from `cursor` on and then from the start. A run may cross the
-/// cursor but not the end of `taken`.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn find_free_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
-    let end = taken.len();
-    let cursor = cursor.min(end);
-    // The second pass reaches n - 1 slots past the cursor, so a run starting
-    // before it is not cut short there.
-    let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-    let mut run = 0;
-    let mut last = usize::MAX;
-    for at in (cursor..end).chain(0..second_end) {
-        // A run cannot wrap past the end.
-        if at != last.wrapping_add(1) {
-            run = 0;
-        }
-        last = at;
-        run = if taken[at] { 0 } else { run + 1 };
-        if run == n {
-            return Some(at + 1 - n);
-        }
-    }
-    None
-}
-
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -103,7 +34,7 @@ pub(crate) struct HeapDesc {
     nodes: u32,
 }
 
-/// Newer titles pass the description followed by
+/// Newer titles (the title) pass the description followed by
 /// memory of their own for the descriptors: an address and its size in
 /// bytes, or a null address to have the heap allocate (inferred from the
 /// title's call sites; older titles pass the plain description).
@@ -128,10 +59,6 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
-    /// Last `watch::writes` asking number scanned for direct CPU copies into
-    /// this heap's memory (`0` before the first sync).
-    #[cfg(windows)]
-    sync_watch: std::sync::Mutex<u64>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -172,37 +99,11 @@ impl Heap {
             .as_ref()
     }
 
-    /// Resolve the buffer view selected by a shader root constant.
+    /// The handle of descriptor `index` of this heap.
     #[cfg(windows)]
-    pub(crate) fn selected_buffer(&self, index: u32) -> Option<host::BufferRead> {
-        if self.desc.kind != VIEWS_KIND || index >= self.desc.count {
-            return None;
-        }
-        let at = self.start.checked_add(u64::from(index) * 32)?;
-        let mut record = [0u32; 3];
-        crate::host::copy_mapped(
-            record.as_mut_ptr().cast(),
-            at as *const u8,
-            size_of_val(&record),
-            false,
-        );
-        let [tag, index, generation] = record;
-        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-        let (view, current) = views.list.get(index as usize)?;
-        if tag != VIEW_TAG || *current != generation {
-            return None;
-        }
-        let pinned = if let View::Shader(resource, _) = view {
-            // SAFETY: a resource's destructor must acquire VIEWS before freeing it.
-            Some(unsafe { crate::object::Held::try_new(*resource as This) }?)
-        } else {
-            None
-        };
-        let view = view.clone();
-        drop(views);
-        let read = host::selected_buffer(&view);
-        drop(pinned);
-        read
+    pub(crate) fn handle(&self, index: u32) -> Option<u64> {
+        let step = u64::from(increment(self.desc.kind)?);
+        (index < self.desc.count).then(|| self.start + u64::from(index) * step)
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
@@ -211,49 +112,6 @@ impl Heap {
         let at = handle.checked_sub(self.start)?;
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
-    }
-
-    /// Detects and mirrors descriptor slots the title wrote directly in heap
-    /// memory (bypassing `Create*View` and `CopyDescriptors*`).
-    ///
-    /// Uses kernel write-watch pages when the heap lives in write-watched title
-    /// memory so clean heaps scan zero slots; falls back to scanning the
-    /// host-mirrored slot range when the heap memory is not write-watched.
-    #[cfg(windows)]
-    pub(crate) fn sync_direct_copies(&self, for_draw: bool) -> usize {
-        let Some(Some(host)) = self.host.get() else {
-            return 0;
-        };
-        let Some(step) = increment(self.desc.kind).map(u64::from) else {
-            return 0;
-        };
-        let mirrored_count = self.desc.count.min(host.count());
-        if mirrored_count == 0 {
-            return 0;
-        }
-        let start = self.start as usize;
-        let end = start.saturating_add(mirrored_count as usize * step as usize);
-        let mut last_watch = self.sync_watch.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((now, pages)) = crate::watch::writes(start, end, false) {
-            let prev = *last_watch;
-            let mut mirrored = 0;
-            for (page, written_at) in pages {
-                if written_at <= prev {
-                    continue;
-                }
-                let page_start = page * crate::watch::PAGE;
-                let page_end = page_start + crate::watch::PAGE;
-                let lo = page_start.max(start) - start;
-                let hi = page_end.min(end) - start;
-                let first_slot = (lo / step as usize) as u32;
-                let end_slot = hi.div_ceil(step as usize).min(mirrored_count as usize) as u32;
-                mirrored += host.sync_slots(self.start, step, first_slot, end_slot, for_draw);
-            }
-            *last_watch = now;
-            return mirrored;
-        }
-        drop(last_watch);
-        host.sync_slots(self.start, step, 0, mirrored_count, for_draw)
     }
 }
 
@@ -297,60 +155,16 @@ fn mirror(handle: u64) {
     }
 }
 
-/// A host-only key, distinct from any aligned title heap pointer and from no heap.
-#[cfg(windows)]
-pub(crate) const ROOT_VIEW_HEAP: usize = usize::MAX;
-
-/// Resolve one of the recording's bound heap keys. The renderer supplies a
-/// small view heap for bounded root descriptors if the title supplied none.
-#[cfg(windows)]
-pub(crate) fn recording_heap(key: usize) -> Option<&'static host::HostHeap> {
-    match key {
-        0 => None,
-        ROOT_VIEW_HEAP => {
-            static ROOT: std::sync::OnceLock<Option<host::HostHeap>> = std::sync::OnceLock::new();
-            ROOT.get_or_init(host::HostHeap::root_views).as_ref()
-        }
-        _ => heap(key as This).host(),
-    }
-}
-
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    if heap == ROOT_VIEW_HEAP {
-        if let Some(host) = recording_heap(heap) {
-            host.release(first, n);
-        }
-        return;
-    }
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.release(first, n);
-    }
-}
-
-/// Mirrors any descriptor slots the title copied directly in memory across all
-/// live, already-initialized shader-visible heaps (called before submission).
-#[cfg(windows)]
-pub(crate) fn sync_all_heaps() {
-    let pinned: Vec<object::Held> = {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps
-            .iter()
-            .filter_map(|&(_, _, at)| {
-                // SAFETY: while `SHADER_HEAPS` is held, no registered `Heap`
-                // has finished `Drop`, so its `Object` refcount is still live.
-                unsafe { object::Held::try_new(at as This) }
-            })
-            .collect()
-    };
-    for held in pinned {
-        heap(held.get()).sync_direct_copies(true);
     }
 }
 
@@ -424,7 +238,8 @@ impl RtvRecord {
                 0,
             ]
         };
-        words[0] = crate::resource::target_format(words[0]);
+        // A target or depth view: of a target, in its stand-in format.
+        words[0] = crate::resource::target_format(crate::resource::pc_format(words[0]));
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
@@ -511,9 +326,21 @@ impl View {
 /// generation, so descriptors (and host slots made from them) naming the
 /// old one go stale instead of naming whatever is made at the same address
 /// next.
-/// shortcut: views without a resource object (constant buffers, memory
-/// views, samplers) are kept for the run; they are bounded by the title's
-/// memory and sampler states.
+///
+/// Views without a resource object have nothing that releases them, and a
+/// title copies descriptors as bytes, so nothing says when the last
+/// descriptor naming an entry is gone: such entries were kept for the run.
+/// The title writes some 14,000 constant buffer views a frame,
+/// each at the address its constants have that frame: 2,450,139 entries
+/// after four minutes of play, 1,047 MB with the index, and 11,000 more
+/// every second (run 65). So the two kinds that carry an address are not
+/// entries any more: their records name them whole ([`constant_words`],
+/// [`placed_words`]), and the table holds only what is bounded: views of
+/// resource objects (freed with the resource), samplers (as many as there
+/// are sampler states), and the shapes of placed views (their descriptions
+/// without the address: as many as the title has kinds of textures and
+/// buffers, however often it moves them).
+/// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
@@ -521,6 +348,9 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
+    /// The shapes of views of placed memory, and where each is.
+    shapes: Vec<Shape>,
+    shape_index: std::collections::BTreeMap<Shape, u32>,
 }
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
@@ -528,8 +358,228 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
+    shapes: Vec::new(),
+    shape_index: std::collections::BTreeMap::new(),
 });
-pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+/// A record is the tag and two words, `i` and `generation` (the host keeps
+/// them as one 64-bit key per slot). The top two bits of `generation` say
+/// what the other 62 bits are: 0, entry `i` of the table at that
+/// generation; [`CONSTANT`], a constant buffer view, whole; [`PLACED`], a
+/// view of placed memory: its address and the number of its shape.
+const KIND_SHIFT: u32 = 30;
+/// Table generations stay below the kind bits (and above 0).
+const GENERATIONS: u32 = (1 << KIND_SHIFT) - 1;
+const CONSTANT: u32 = 1;
+const PLACED: u32 = 2;
+/// Bits of a constant buffer view's address in its record: any address a
+/// program can have. The 15 bits above them are its size.
+const CONSTANT_ADDRESS_BITS: u32 = 47;
+/// Bits of a placed view's address in its record: placed memory is title
+/// memory, which lies below 1 TiB. The 22 bits above them number its shape.
+const PLACED_ADDRESS_BITS: u32 = 40;
+const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
+
+/// A view of placed memory without its address: whether it is unordered
+/// access, the resource description, and the view's words but the two that
+/// hold the address (10 and 11).
+type Shape = (bool, [u32; 14], [u32; 14]);
+
+/// Whether constant buffer views and views of placed memory are named whole
+/// in their records ([`Views`]). On by default; `VICTORY_VIEW_INLINE=0`
+/// makes every view a table entry, as before.
+fn inline() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_INLINE").is_none_or(|v| v != "0"))
+}
+
+/// Views named whole in their records since the start: constant buffer
+/// views, views of placed memory (for the memory line).
+static NAMED_WHOLE: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The two record words of the 62 bits `payload` of kind `kind`.
+fn kind_words(kind: u32, payload: u64) -> [u32; 2] {
+    [payload as u32, kind << KIND_SHIFT | (payload >> 32) as u32]
+}
+
+/// The 62 bits two record words carry beside their kind.
+fn payload(i: u32, generation: u32) -> u64 {
+    u64::from(generation & GENERATIONS) << 32 | u64::from(i)
+}
+
+/// The record words that name the constant buffer view of `size` bytes at
+/// `address` whole; `None` if they cannot: an address past 47 bits, or a
+/// size of 16 KiB or more that is no multiple of 256 or reaches 4 MiB (the
+/// size has 15 bits: bytes below 16 KiB, else units of 256 bytes). Such a
+/// view is a table entry.
+fn constant_words(address: u64, size: u32) -> Option<[u32; 2]> {
+    if address >> CONSTANT_ADDRESS_BITS != 0 {
+        return None;
+    }
+    let code = if size < 1 << 14 {
+        u64::from(size)
+    } else if size.is_multiple_of(256) && size >> 8 < 1 << 14 {
+        1 << 14 | u64::from(size >> 8)
+    } else {
+        return None;
+    };
+    Some(kind_words(
+        CONSTANT,
+        code << CONSTANT_ADDRESS_BITS | address,
+    ))
+}
+
+/// The constant buffer view [`constant_words`] named.
+fn constant_of(i: u32, generation: u32) -> View {
+    let payload = payload(i, generation);
+    let code = (payload >> CONSTANT_ADDRESS_BITS) as u32;
+    let size = if code >> 14 == 0 {
+        code
+    } else {
+        (code & 0x3fff) << 8
+    };
+    View::Constant(payload & ((1 << CONSTANT_ADDRESS_BITS) - 1), size)
+}
+
+/// A placed view's shape and its address.
+fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    let mut rest = [0u32; 14];
+    rest[..10].copy_from_slice(&desc[..10]);
+    rest[10..].copy_from_slice(&desc[12..]);
+    (
+        (unordered, *resource, rest),
+        u64::from(desc[10]) | u64::from(desc[11]) << 32,
+    )
+}
+
+/// The record words that name the view of placed memory at `address` with
+/// shape number `shape`.
+fn placed_words(shape: u32, address: u64) -> [u32; 2] {
+    kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
+}
+
+impl Views {
+    /// The number of `shape`, a new one if it is not there yet; `None` when
+    /// the shapes are full (the view is then a table entry).
+    fn shape(&mut self, shape: Shape) -> Option<u32> {
+        if let Some(&at) = self.shape_index.get(&shape) {
+            return Some(at);
+        }
+        if self.shapes.len() >= SHAPES {
+            return None;
+        }
+        let at = self.shapes.len() as u32;
+        self.shapes.push(shape);
+        self.shape_index.insert(shape, at);
+        Some(at)
+    }
+
+    /// The view of placed memory [`placed_words`] named.
+    fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
+        let payload = payload(i, generation);
+        let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+        let &(unordered, resource, rest) =
+            self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&rest[..10]);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        desc[12..].copy_from_slice(&rest[10..]);
+        Some(View::Placed(unordered, resource, desc))
+    }
+
+    /// The record words of `view` as a table entry: its entry (a new or a
+    /// freed one if the view is not there yet) and that entry's generation.
+    fn entry(&mut self, view: View) -> [u32; 2] {
+        let i = match self.index.get(&view) {
+            Some(&i) => i,
+            None => {
+                let i = match self.free.pop() {
+                    Some(i) => {
+                        self.list[i as usize].0 = view.clone();
+                        i
+                    }
+                    None => {
+                        self.list.push((view.clone(), 1));
+                        self.list.len() as u32 - 1
+                    }
+                };
+                for r in view.resources().into_iter().filter(|&r| r != 0) {
+                    self.by_resource.entry(r).or_default().push(i);
+                }
+                self.index.insert(view, i);
+                i
+            }
+        };
+        [i, self.list[i as usize].1]
+    }
+}
+
+/// The two words that name `view` in a record: the view itself where its
+/// kind allows ([`Views`]), else its table entry.
+fn words_for(view: View) -> [u32; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    if inline() {
+        match &view {
+            View::Constant(address, size) => {
+                if let Some(words) = constant_words(*address, *size) {
+                    NAMED_WHOLE[0].fetch_add(1, Relaxed);
+                    return words;
+                }
+            }
+            View::Placed(unordered, resource, desc) => {
+                let (shape, address) = shape_of(*unordered, resource, desc);
+                if address >> PLACED_ADDRESS_BITS == 0 {
+                    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(shape) = views.shape(shape) {
+                        NAMED_WHOLE[1].fetch_add(1, Relaxed);
+                        return placed_words(shape, address);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(view)
+}
+
+/// For the memory line: the distinct views kept ([`Views`]), those of them
+/// free for reuse, and the bytes the table and its index hold for them (an
+/// estimate: an entry of the table, and one of the index with its share of
+/// a tree node; the shapes likewise); then the entries that are constant
+/// buffer views and views of placed memory (those that did not fit a
+/// record, or all of them with `VICTORY_VIEW_INLINE=0`), the shapes of
+/// placed views kept, and the views named whole in their records since the
+/// start: constant buffer views, views of placed memory.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn views_kept() -> [u64; 8] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let each = size_of::<(View, u32)>() as u64;
+    let shape = size_of::<Shape>() as u64;
+    let (mut constants, mut placed) = (0, 0);
+    for (view, _) in &views.list {
+        match view {
+            View::Constant(..) => constants += 1,
+            View::Placed(..) => placed += 1,
+            _ => {}
+        }
+    }
+    [
+        views.list.len() as u64,
+        views.free.len() as u64,
+        views.list.capacity() as u64 * each
+            + views.index.len() as u64 * each * 3 / 2
+            + views.shapes.capacity() as u64 * shape
+            + views.shape_index.len() as u64 * shape * 3 / 2,
+        constants,
+        placed,
+        views.shapes.len() as u64,
+        NAMED_WHOLE[0].load(Relaxed),
+        NAMED_WHOLE[1].load(Relaxed),
+    ]
+}
 
 impl View {
     /// The resource objects the view names.
@@ -540,97 +590,158 @@ impl View {
             _ => [0, 0],
         }
     }
+
+    /// The texture object the view is of, if that texture has no host copy
+    /// yet (`crate::resource::host_waits`): a slot written with such a
+    /// view is left null until the texture is first used.
+    #[cfg(windows)]
+    fn waiting_texture(&self) -> Option<usize> {
+        match *self {
+            View::Shader(r, _) | View::Unordered(r, _, _)
+                if crate::resource::host_waits(r as This) =>
+            {
+                Some(r)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Title slots (their handles) written with a view of a texture object
+/// that had no host copy then, by texture. A title texture gets its host
+/// copy on first use (`resource.rs` `Hosted`), and the title
+/// writes each texture's views into its view heap when it creates the
+/// texture: making those host slots would make every host copy at once.
+/// They are made when the texture is: translated shaders index the heap
+/// directly, so a slot is not always made again by the draw that reads it.
+#[cfg(windows)]
+static WAITING: std::sync::Mutex<std::collections::BTreeMap<usize, Vec<u64>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Textures given their host copy since [`make_waiting`] last ran.
+#[cfg(windows)]
+static MADE_LATE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Title texture `resource` was given its host copy (called under that
+/// texture's own lock: nothing else is locked here).
+#[cfg(windows)]
+pub(crate) fn texture_made(resource: usize) {
+    MADE_LATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(resource);
+}
+
+/// The slot at `handle` was written with a view of texture `resource`,
+/// which has no host copy: it waits for one.
+#[cfg(windows)]
+fn wait_for(resource: usize, handle: u64) {
+    /// A texture with more slots waiting than this is in use for all we
+    /// know (its views are being copied about): its host copy is made.
+    const MOST: usize = 64;
+    let many = {
+        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = waiting.entry(resource).or_default();
+        if !slots.contains(&handle) {
+            slots.push(handle);
+        }
+        slots.len() > MOST
+    };
+    if many {
+        // Makes it, and notes it made.
+        let _ = crate::resource::host_copy(resource as This);
+    } else if !crate::resource::host_waits(resource as This) {
+        // Made by another thread since the slot was looked at: that making
+        // may have been taken by `make_waiting` before this slot was noted.
+        texture_made(resource);
+    }
+}
+
+/// Makes the host slots that waited for a texture's host copy, for the
+/// textures made since the last call. Called before a submission runs, by
+/// the thread that submits: a slot is read when a list runs.
+#[cfg(windows)]
+pub(crate) fn make_waiting() {
+    let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
+    for resource in made {
+        let handles = WAITING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&resource);
+        for handle in handles.into_iter().flatten() {
+            // Only if the slot still holds a view of that texture: the
+            // title may have written it since (and a view of another
+            // texture without a host copy must go on waiting).
+            // (Looked up first: the handle is read only while its heap is
+            // there.)
+            let Some((heap, index)) = shader_slot(handle) else {
+                continue;
+            };
+            let same = match view(handle) {
+                Some(View::Shader(r, _) | View::Unordered(r, _, _)) => r == resource,
+                _ => false,
+            };
+            if same && let Some(Some(host)) = heap.host.get() {
+                host.mirror(index, handle, true);
+            }
+        }
+    }
 }
 
 fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let i = match views.index.get(&view) {
-        Some(&i) => i,
-        None => {
-            let i = match views.free.pop() {
-                Some(i) => {
-                    views.list[i as usize].0 = view.clone();
-                    i
-                }
-                None => {
-                    views.list.push((view.clone(), 1));
-                    views.list.len() as u32 - 1
-                }
-            };
-            for r in view.resources().into_iter().filter(|&r| r != 0) {
-                views.by_resource.entry(r).or_default().push(i);
-            }
-            views.index.insert(view, i);
-            i
-        }
-    };
-    let generation = views.list[i as usize].1;
+    let [i, generation] = words_for(view);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
-    drop(views);
     #[cfg(windows)]
     mirror(handle);
 }
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(entries) = views.by_resource.remove(&resource) {
-        for i in entries {
-            let (view, generation) = views.list[i as usize].clone();
-            // Entries freed through a view's other resource may hold another
-            // view by now.
-            if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
-                continue;
-            }
-            views.index.remove(&view);
-            views.list[i as usize].1 = generation.wrapping_add(1).max(1);
-            // The view's other resource (a counter) keeps a stale entry, which
-            // `forget` of that resource skips.
-            views.free.push(i);
-        }
-    }
-    drop(views);
-    // Always clear host bindless trackers even when `by_resource` had no entry
-    // (for example, `View::Placed` textures resolved via `placed_texture`).
     #[cfg(windows)]
-    forget_host_resources(resource);
-}
-
-/// Drops all live bindless-tracker references to `resource` from every
-/// initialized shader-visible view heap, synchronizing with any in-progress
-/// `Heap::host()` publication so a freed resource cannot be published live.
-#[cfg(windows)]
-fn forget_host_resources(resource: usize) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    for &(_, _, at) in heaps.iter() {
-        // SAFETY: registered heaps are live (removed when dropped).
-        let heap = unsafe { &*(at as *const Heap) };
-        if heap.samplers() {
+    WAITING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&resource);
+    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(entries) = views.by_resource.remove(&resource) else {
+        return;
+    };
+    for i in entries {
+        let (view, generation) = views.list[i as usize].clone();
+        // Entries freed through a view's other resource may hold another
+        // view by now.
+        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
-        if let Some(Some(host)) = heap.host.get() {
-            host.forget_resource(resource);
-        } else {
-            // Wait for any concurrent `Heap::host()` initialization holding
-            // `heap.pending` to finish publishing before checking again.
-            let _pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(Some(host)) = heap.host.get() {
-                host.forget_resource(resource);
-            }
-        }
+        views.index.remove(&view);
+        // (Below the bits that say a record is no table entry.)
+        views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        // The view's other resource (a counter) keeps a stale entry, which
+        // `forget` of that resource skips.
+        views.free.push(i);
     }
 }
 
-/// The view of entry `i` if `generation` is still its own.
-#[cfg(windows)]
+/// The view the record words `i` and `generation` name: the one they hold
+/// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    match generation >> KIND_SHIFT {
+        0 => {
+            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let (view, current) = views.list.get(i as usize)?;
+            (*current == generation).then(|| view.clone())
+        }
+        CONSTANT => Some(constant_of(i, generation)),
+        PLACED => VIEWS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .placed_of(i, generation),
+        _ => None,
+    }
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -640,9 +751,10 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    if tag != VIEW_TAG {
+        return None;
+    }
+    view_at(i, generation)
 }
 
 /// A description of `N` words, if the title passes one.
@@ -653,9 +765,10 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    let [lo, hi, size, _] = words(desc).unwrap_or_default();
-    let address = u64::from(lo) | u64::from(hi) << 32;
-    record(handle, View::Constant(address, size));
+    if let Some([lo, hi, size, _]) = words(desc) {
+        let address = u64::from(lo) | u64::from(hi) << 32;
+        record(handle, View::Constant(address, size));
+    }
 }
 
 /// Device method.
@@ -680,23 +793,6 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
-/// Copy only the fields of a placed resource description. Padding can differ
-/// between two views of the same texture and the caller may leave it unwritten.
-fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
-    if desc.is_null() {
-        return None;
-    }
-    let src = desc.cast::<u32>();
-    let mut fields = [0; 14];
-    // SAFETY: the caller supplies a 56-byte ResourceDesc, possibly unaligned.
-    // Dimension occupies word 0. Alignment through Flags occupy words 2..13.
-    unsafe {
-        fields[0] = src.read_unaligned();
-        fields[2..13].copy_from_slice(&src.add(2).cast::<[u32; 11]>().read_unaligned());
-    }
-    Some(fields)
-}
-
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -706,7 +802,7 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -717,7 +813,7 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -862,8 +958,6 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
-        #[cfg(windows)]
-        sync_watch: std::sync::Mutex::new(0),
     });
     #[cfg(windows)]
     if visible {
@@ -883,13 +977,11 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
-extern "system" fn desc(this: This, out: *mut HeapDesc) -> *mut HeapDesc {
+extern "system" fn desc(this: This, out: *mut HeapDesc) {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(heap(this).desc) };
     }
-    out
 }
 /// The same address for the CPU and the GPU start.
 extern "system" fn start(this: This) -> u64 {
@@ -924,90 +1016,6 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_reservation_still_allows_smaller_tables_and_released_slots() {
-        let mut slots = DynamicSlots::new(8);
-        assert_eq!(slots.reserve(8), Some(0));
-        slots.release(2, 2);
-        slots.release(5, 2);
-        assert_eq!(slots.reserve(3), None);
-        assert_eq!(slots.first_miss, 3);
-        assert_eq!(slots.reserve(4), None);
-        assert_eq!(slots.reserve(2), Some(2));
-        assert_eq!(slots.first_miss, 3);
-        slots.release(4, 1);
-        assert_eq!(slots.reserve(3), Some(4));
-    }
-
-    /// Each sample represents one batch of table requests on a recording thread.
-    #[test]
-    #[ignore = "benchmark"]
-    fn dynamic_table_reservation_times() {
-        use std::{hint::black_box, time::Instant};
-
-        const CAPACITY: usize = 1 << 18;
-        for full in [false, true] {
-            let mut slots = DynamicSlots::new(CAPACITY);
-            if full {
-                assert_eq!(slots.reserve(CAPACITY), Some(0));
-            }
-            let mut times = Vec::new();
-            for _ in 0..40 {
-                // Give the full heap one short lived table every batch. A fresh
-                // miss then costs a search, as it would after a list retires.
-                if full {
-                    slots.release(0, 1);
-                    assert_eq!(slots.reserve(1), Some(0));
-                }
-                let start = Instant::now();
-                for _ in 0..128 {
-                    let got = black_box(&mut slots).reserve(black_box(4));
-                    if !full {
-                        slots.release(got.unwrap(), 4);
-                    } else {
-                        assert!(got.is_none());
-                    }
-                }
-                times.push(start.elapsed().as_nanos());
-            }
-            times.sort_unstable();
-            eprintln!(
-                "full={full} ns per 128 requests: median={} p95={} max={}",
-                times[20], times[37], times[39]
-            );
-        }
-    }
-
-    #[test]
-    fn free_run_may_cross_the_search_cursor() {
-        // Free slots 1..=4 around a cursor of 3.
-        let mut taken = [true; 8];
-        taken[1..5].fill(false);
-        assert_eq!(find_free_run(&taken, 3, 4), Some(1));
-        assert_eq!(find_free_run(&taken, 3, 5), None);
-    }
-
-    #[test]
-    fn free_run_does_not_wrap_past_the_end() {
-        let mut taken = [true; 8];
-        taken[0] = false;
-        taken[7] = false;
-        assert_eq!(find_free_run(&taken, 5, 2), None);
-        assert_eq!(find_free_run(&[false; 8], 5, 8), Some(0));
-        assert_eq!(find_free_run(&[false; 8], 8, 3), Some(0));
-    }
-
-    #[test]
-    fn a_null_cbv_overwrites_the_previous_descriptor() {
-        let mut slot = [0u64; 4];
-        let handle = slot.as_mut_ptr() as u64;
-        create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], handle);
-        assert_eq!(view(handle), Some(View::Constant(0x1000, 256)));
-
-        create_cbv(std::ptr::null(), std::ptr::null(), handle);
-        assert_eq!(view(handle), Some(View::Constant(0, 0)));
-    }
-
-    #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
         let desc = HeapDesc {
@@ -1030,38 +1038,7 @@ mod tests {
         unsafe { (cpu as *mut u8).add(999 * 32 + 31).write(1) };
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
-        let mut bad_h = null;
-        assert_eq!(create(bad, none, &mut bad_h), E_INVALIDARG);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
-    }
-
-    #[test]
-    fn placed_views_share_resources_across_description_padding() {
-        let mut slot = [0u32; 8];
-        let handle = slot.as_mut_ptr() as u64;
-        let view_desc = [0u32; 16];
-        let null = std::ptr::null();
-        let mut resource = [3, 0, 0, 0, 8, 0, 8, 0x10001, 28, 1, 0, 0, 0, 0];
-        let expected = resource;
-        for (unordered, create) in [
-            (false, create_placed_srv as extern "system" fn(_, _, _, _)),
-            (true, create_placed_uav),
-        ] {
-            create(null, &expected, &view_desc, handle);
-            let first = slot;
-            resource[1] = 0xaaaa_aaaa;
-            resource[13] = 0xbbbb_bbbb;
-            create(null, &resource, &view_desc, handle);
-            assert_eq!(slot, first);
-            assert_eq!(
-                view(handle),
-                Some(View::Placed(unordered, expected, view_desc))
-            );
-            let mut other = resource;
-            other[12] = 4;
-            create(null, &other, &view_desc, handle);
-            assert_ne!(slot, first);
-        }
+        assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
     }
 
     #[test]
@@ -1096,6 +1073,126 @@ mod tests {
         assert_eq!(view(s3), view(s1));
         assert_eq!(view(at(0) + 8), None);
         heap[0] = 0;
+    }
+
+    /// Constant buffer views are named whole in their records: any address
+    /// a program can have, any size below 16 KiB, multiples of 256 bytes
+    /// up to 4 MiB; what does not fit says so.
+    #[test]
+    fn constant_views_fit_their_records() {
+        let top = (1u64 << CONSTANT_ADDRESS_BITS) - 1;
+        for address in [
+            0u64,
+            0x100,
+            0x2602_0000,
+            0xd_6b60_0000,
+            0x7ffd_a34f_0000,
+            top,
+        ] {
+            for size in [
+                0u32,
+                1,
+                255,
+                256,
+                4000,
+                (1 << 14) - 1,
+                1 << 14,
+                65536,
+                (1 << 22) - 256,
+            ] {
+                let [i, generation] = constant_words(address, size).expect("fits");
+                assert_eq!(generation >> KIND_SHIFT, CONSTANT);
+                assert_eq!(
+                    view_at(i, generation),
+                    Some(View::Constant(address, size)),
+                    "{address:#x} {size}"
+                );
+            }
+        }
+        assert_eq!(
+            constant_words(top + 1, 256),
+            None,
+            "an address past 47 bits"
+        );
+        assert_eq!(
+            constant_words(0x1000, (1 << 14) + 1),
+            None,
+            "16 KiB or more, no multiple of 256"
+        );
+        assert_eq!(constant_words(0x1000, 1 << 22), None, "4 MiB");
+        // Different views never share their words.
+        assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
+        assert_ne!(constant_words(0x1000, 256), constant_words(0x1100, 256));
+        assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
+    }
+
+    /// The leak of run 65: a title that writes constant buffer views and
+    /// views of placed memory at ever new addresses adds nothing to the
+    /// table; one shape stands for all the placed views alike.
+    #[test]
+    fn views_at_new_addresses_add_no_entries() {
+        if !inline() {
+            return;
+        }
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let at = slots.as_ptr() as u64;
+        // A resource description and a view no other test uses.
+        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        let mine = |v: &View| match v {
+            View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
+            View::Placed(_, r, _) => *r == resource,
+            _ => false,
+        };
+        let entries = || {
+            VIEWS
+                .lock()
+                .unwrap()
+                .list
+                .iter()
+                .filter(|(v, _)| mine(v))
+                .count()
+        };
+        let shapes = || {
+            VIEWS
+                .lock()
+                .unwrap()
+                .shapes
+                .iter()
+                .filter(|s| s.1 == resource)
+                .count()
+        };
+        for n in 0..20_000u64 {
+            let address = 0x6_0000_0000 + n * 0x100;
+            create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
+            assert_eq!(view(at), Some(View::Constant(address, 512)));
+            let placed = 0xd_4940_0000 + n * 0x1_0000;
+            (desc[10], desc[11]) = (placed as u32, (placed >> 32) as u32);
+            create_placed_srv(null, &resource, &desc, at);
+            assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        }
+        assert_eq!(entries(), 0, "no table entries");
+        assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
+        // The same shape, unordered: another shape.
+        create_placed_uav(null, &resource, &desc, at);
+        assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
+        assert_eq!(shapes(), 2);
+        // Placed memory past 1 TiB (not title memory) is a table entry.
+        (desc[10], desc[11]) = (0, 0x100);
+        create_placed_srv(null, &resource, &desc, at);
+        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        assert_eq!(entries(), 1);
+        // A record's words are the same for the same view (the host knows
+        // a slot's view by them), and differ with the address.
+        // SAFETY: both handles are slots of 32 bytes above.
+        let words = |handle: u64| unsafe { *(handle as *const [u32; 3]) };
+        let other = [0u64; 4];
+        create_cbv(null, &[0x40, 6, 512, 0], at);
+        create_cbv(null, &[0x40, 6, 512, 0], other.as_ptr() as u64);
+        assert_eq!(words(at), words(other.as_ptr() as u64));
+        create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
+        assert_ne!(words(at), words(other.as_ptr() as u64));
     }
 
     /// A released resource's views go stale; the same view of a new
@@ -1143,42 +1240,8 @@ mod tests {
         );
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
         // A size that does not match the count is not a placement.
-        let mut h2 = std::ptr::null();
-        assert_eq!(create(desc, Placement { address, size: 7 }, &mut h2), S_OK);
-        assert_ne!(
-            slot::<extern "system" fn(This) -> u64>(h2, 0x48)(h2),
-            address
-        );
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(h2, 0x10)(h2), 0);
-    }
-
-    #[test]
-    fn heap_get_desc_returns_its_output_pointer() {
-        let desc = HeapDesc {
-            kind: 1,
-            count: 16,
-            flags: 0,
-            nodes: 1,
-        };
-        let none = Placement {
-            address: 0,
-            size: 0,
-        };
-        let mut h = std::ptr::null();
-        assert_eq!(create(desc, none, &mut h), S_OK);
-        let mut out = std::mem::MaybeUninit::<HeapDesc>::uninit();
-        type GetDesc = extern "system" fn(This, *mut HeapDesc) -> *mut HeapDesc;
-        let get_desc = slot::<GetDesc>(h, 0x40);
-        assert_eq!(get_desc(h, out.as_mut_ptr()), out.as_mut_ptr());
-        // SAFETY: written above.
-        let read = unsafe { out.assume_init() };
-        assert_eq!(
-            (read.kind, read.count, read.flags, read.nodes),
-            (desc.kind, desc.count, desc.flags, desc.nodes)
-        );
-        assert!(get_desc(h, std::ptr::null_mut()).is_null());
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
+        assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
     }
 }

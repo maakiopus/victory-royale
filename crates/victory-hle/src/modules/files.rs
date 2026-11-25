@@ -21,7 +21,6 @@ use std::sync::{Mutex, MutexGuard};
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
-use crate::modules::paths;
 use crate::{HleExport, HleModule, hle_export};
 
 /// The host's own function: what the import would have been bound to.
@@ -84,28 +83,97 @@ pub fn mount_at(letter: char, root: &Path) {
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
-/// keeps its own). An empty root is the current directory, as it is to a
-/// path joined to it: it is the title's folder when the title is run by its
-/// file name alone (`victory run title.exe`).
+/// keeps its own).
 fn root_wide(root: &Path) -> Vec<u16> {
-    let root = if root.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        root
-    };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
-    while wide.len() > 3 && wide.last().is_some_and(|c| paths::SEPARATORS.contains(c)) {
+    while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
         wide.pop();
     }
     wide
 }
 
+const SEPARATORS: [u16; 2] = [b'\\' as u16, b'/' as u16];
+const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+
+/// Host paths from this length on take the `\\?\` form, which lifts the
+/// host's MAX_PATH limit (248 characters for a directory, 260 for a file).
+const LONG: usize = 248;
+
+/// `root` and the title's `tail` as a `\\?\` path. That form turns off the
+/// host's own clean-up, so `/` becomes `\` and `.` and `..` are resolved
+/// here (`..` stops at the root).
+fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
+    let backslash = u16::from(b'\\');
+    let mut out = if root.starts_with(&VERBATIM) {
+        root.to_vec()
+    } else if let Some(unc) = root.strip_prefix(&[backslash; 2][..]) {
+        let mut out = VERBATIM.to_vec();
+        out.extend("UNC\\".encode_utf16());
+        out.extend_from_slice(unc);
+        out
+    } else {
+        [&VERBATIM[..], root].concat()
+    };
+    while out.last() == Some(&backslash) {
+        out.pop();
+    }
+    let dot = u16::from(b'.');
+    let mut parts: Vec<&[u16]> = Vec::new();
+    for part in tail.split(|c| SEPARATORS.contains(c)) {
+        match part {
+            [] => {}
+            [d] if *d == dot => {}
+            [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
+            _ => parts.push(part),
+        }
+    }
+    for part in parts {
+        out.push(backslash);
+        out.extend_from_slice(part);
+    }
+    out
+}
+
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on
-/// a virtual drive. The lexical rules are host-independent so CI tests
-/// them; only the mounted drives come from here.
+/// a virtual drive.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
-    paths::translate(path, &drives())
+    let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
+        Some(rest) => (&VERBATIM[..], rest),
+        None => (&[][..], path),
+    };
+    let &[letter, colon, ..] = rest else {
+        return None;
+    };
+    if colon != u16::from(b':') {
+        return None;
+    }
+    let letter = u8::try_from(letter).ok().filter(u8::is_ascii_alphabetic)?;
+    let letter = u16::from(letter.to_ascii_uppercase());
+    let drives = drives();
+    let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
+    let tail = &rest[2..];
+    if prefix.is_empty() && root.len() + tail.len() >= LONG {
+        let mut out = verbatim(root, tail);
+        out.push(0);
+        return Some(out);
+    }
+    let mut out = prefix.to_vec();
+    out.extend_from_slice(root);
+    // `X:` and `X:name` are relative to the root.
+    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
+        out.push(b'\\'.into());
+    }
+    let verbatim = !prefix.is_empty();
+    out.extend(tail.iter().map(|&c| {
+        if verbatim && c == u16::from(b'/') {
+            b'\\'.into()
+        } else {
+            c
+        }
+    }));
+    out.push(0);
+    Some(out)
 }
 
 /// A title's wide path: the host path when it is on a virtual drive, else
@@ -150,9 +218,12 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
     // SAFETY: the title passes a NUL-terminated path.
     let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
     // The drive part is ASCII in every code page; decode only candidates.
-    if !paths::has_drive(bytes) {
-        tracing::debug!(path = %String::from_utf8_lossy(bytes), "title path");
-        return None;
+    match bytes.strip_prefix(br"\\?\").unwrap_or(bytes) {
+        [letter, b':', ..] if letter.is_ascii_alphabetic() => {}
+        _ => {
+            tracing::debug!(path = %String::from_utf8_lossy(bytes), "title path");
+            return None;
+        }
     }
     let len = i32::try_from(bytes.len()).ok()?;
     // SAFETY: sizing call, then a call with room for `n` units.
@@ -354,7 +425,7 @@ pub extern "system" fn GetDiskFreeSpaceW(
     if let Some(host) = &mut p.1
         && let [letter, colon, sep, ..] = host[..]
         && colon == u16::from(b':')
-        && paths::SEPARATORS.contains(&sep)
+        && SEPARATORS.contains(&sep)
     {
         *host = vec![letter, colon, sep, 0];
     }
@@ -448,7 +519,11 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // fail there instead of faulting into its handler; the title's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first, and kept open until the read is done.
+// is opened first. A block guarded again before the kernel writes it (the
+// guard over all the views of a page protects other views from other
+// threads) fails that `ReadFile`, and the title's retry opens it again;
+// `fread` has no such retry and reads beside instead (see there).
+
 pub extern "system" fn ReadFile(
     file: *mut c_void,
     buffer: *mut u8,
@@ -456,18 +531,10 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError};
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    );
-    // shortcut: an overlapped read still pending keeps its blocks open for
-    // good (they are copied at every refresh), since its end is not seen.
-    // SAFETY: reads the thread's last error, which stays as it is.
-    if !(done == 0 && !overlapped.is_null() && unsafe { GetLastError() } == ERROR_IO_PENDING) {
-        victory_gpu::kernel_wrote(buffer as usize, len as usize);
-    }
-    done
+    )
 }
 
 /// The host CRT reads large requests straight into the caller's buffer
@@ -478,12 +545,30 @@ pub extern "system" fn ReadFile(
 /// own writes. Returns the items read, as the CRT does; the bytes of a
 /// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    let n = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
-        buffer, size, count, stream,
-    );
-    victory_gpu::kernel_wrote(buffer as usize, size.saturating_mul(count));
-    n
+    let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
+    let total = size.saturating_mul(count);
+    if buffer.is_null() || total == 0 {
+        // The CRT's own checks and answer (EINVAL, or nothing to read).
+        return read(buffer, size, count, stream);
+    }
+    const CHUNK: usize = 1 << 20;
+    let mut beside = vec![0u8; total.min(CHUNK)];
+    let mut done = 0;
+    while done < total {
+        let want = (total - done).min(CHUNK);
+        let n = read(beside.as_mut_ptr(), 1, want, stream);
+        if n > 0 {
+            victory_gpu::kernel_will_write(buffer as usize + done, n);
+            // SAFETY: the caller's buffer holds `size * count` bytes, and
+            // `done + n` is at most that.
+            unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
+            done += n;
+        }
+        if n < want {
+            break;
+        }
+    }
+    done / size
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
@@ -789,20 +874,9 @@ mod tests {
             Some(format!(r"\\?\{}\a\{long}\f", package.path().display()))
         );
         assert_eq!(
-            paths::verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
+            verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
         );
-    }
-
-    /// A title run by its file name alone has an empty folder: the drive
-    /// over it is the current directory, not the current drive's root.
-    #[test]
-    fn an_empty_root_is_the_current_directory() {
-        let letter = mount(Path::new("")).unwrap();
-        let path = format!(r"{letter}:\a.rpf");
-        let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
-        let cwd = std::env::current_dir().unwrap();
-        assert_eq!(host, Some(cwd.join("a.rpf").display().to_string()));
     }
 
     #[test]

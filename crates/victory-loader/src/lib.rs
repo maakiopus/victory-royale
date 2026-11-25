@@ -22,13 +22,10 @@
 //!    on, pass every thread start and end on to the attached images.
 
 #[cfg(windows)]
-mod crash;
+mod console_insn;
 #[cfg(windows)]
-mod hooks;
+mod crash;
 pub mod prepare;
-// Only the Windows loader publishes images; the tests run everywhere.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;

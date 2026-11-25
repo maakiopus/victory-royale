@@ -12,26 +12,21 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Presentation
-//! (the title's present plane → host swap chain) lives in [`queue`].
+//! share, [`console`] which console model the title sees. Planned:
+//! `present` (swap chain).
 
-// Off Windows there is no host GPU: only the portable parts are built (for
-// their tests), and the paths that feed the host go unused.
-#![cfg_attr(not(windows), allow(dead_code, unused_variables, unused_mut))]
+// shortcut: the D3D12 host paths are Windows-only. On Linux the workspace
+// tests build this crate without them; the helpers stay for the Windows build.
+#![cfg_attr(
+    not(windows),
+    allow(dead_code, unused_imports, unused_variables, unused_mut)
+)]
 
-mod adapter;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
-/// Diagnostics: counters raised by this crate's callers (the title's page
-/// scatters), which ride the frame line with the copy statistics.
-#[cfg(all(windows, feature = "diagnostics"))]
-pub mod stats {
-    pub use super::copystat::{C, add};
-}
-
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -42,25 +37,20 @@ pub mod frame;
 #[cfg(any(windows, test))]
 mod frame_times;
 #[cfg(windows)]
-mod hlsl;
-#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
-// CPU model of the GPU budget: only referenced from unit tests.
-#[cfg(test)]
-mod indirect_budget;
+#[cfg(windows)]
+mod inplace;
 pub mod list;
+#[cfg(windows)]
+mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod profile;
 pub mod query;
 pub mod queue;
-#[cfg(windows)]
-mod rectangles;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -70,14 +60,17 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
-mod switch;
 #[cfg(windows)]
 mod texture;
-mod timeline;
 #[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
-pub use host::{HdrDisplayInfo, display_hdr_info, on_failure, write_title_memory};
+pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{kernel_will_write, kernel_wrote, title_memory_remapped};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use watch::{
+    title_memory_reading, title_memory_remapped, title_memory_remapping,
+    writing as kernel_will_write,
+};

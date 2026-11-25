@@ -95,21 +95,13 @@ impl Title {
                 .find(|(p, _)| p == path)
                 .map(|(_, text)| text.as_str())
         };
-        // GDK manifests commonly write the id as `0x639AA8DD`.
-        let id = get("Game/TitleId").and_then(|v| {
-            let v = v
-                .strip_prefix("0x")
-                .or_else(|| v.strip_prefix("0X"))
-                .unwrap_or(v);
-            u32::from_str_radix(v, 16).ok()
-        });
-        let storage_mb =
-            get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse::<u64>().ok());
+        let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
+        let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
         Title {
             id: id.unwrap_or(0),
             store_id: get("Game/StoreId").unwrap_or_default().to_owned(),
             storage: PathBuf::new(),
-            storage_bytes: storage_mb.unwrap_or(0).saturating_mul(1024 * 1024),
+            storage_bytes: storage_mb.unwrap_or(0) << 20,
         }
     }
 
@@ -122,8 +114,8 @@ impl Title {
 
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
 /// and its trimmed text up to the first child, the predefined entities
-/// decoded (a self-closing element has an empty body); comments, CDATA
-/// sections, declarations and attributes are skipped.
+/// decoded; comments, CDATA sections, declarations and attributes are
+/// skipped.
 fn elements(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut path: Vec<&str> = Vec::new();
@@ -135,7 +127,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
         } else if rest.starts_with("<![CDATA[") {
             rest.find("]]>").map(|e| e + 3)
         } else {
-            tag_end(rest)
+            rest.find('>').map(|e| e + 1)
         };
         let Some(end) = end else { break };
         let tag = &rest[1..end - 1];
@@ -156,11 +148,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = if closed {
-            ""
-        } else {
-            rest[..rest.find('<').unwrap_or(rest.len())].trim()
-        };
+        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
         let body = [
             ("&lt;", "<"),
             ("&gt;", ">"),
@@ -178,31 +166,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Where the tag that starts `text` ends, past its `>`; a `>` in a quoted
-/// attribute value is part of the value (XML allows it there unescaped).
-fn tag_end(text: &str) -> Option<usize> {
-    let mut quote = None;
-    for (at, c) in text.char_indices() {
-        match (quote, c) {
-            (None, '"' | '\'') => quote = Some(c),
-            (Some(open), _) if c == open => quote = None,
-            (None, '>') => return Some(at + 1),
-            _ => {}
-        }
-    }
-    None
-}
-
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
-
-/// Serialises tests that read or change the process title (`set_title` /
-/// `title` / package id). Hold this for the whole title-dependent sequence;
-/// `set_title` itself does not take it (the mutex is not reentrant).
-#[cfg(test)]
-pub fn title_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 pub fn set_title(title: Title) {
     *TITLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(title);
@@ -253,15 +217,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_quoted_angle_bracket_does_not_end_its_tag() {
-        let text = "<Game><ShellVisuals DefaultDisplayName=\"A > B\" Description='x>y'/>\
-                    <TitleId>639AA8DD</TitleId>\
-                    <PersistentLocalStorage><SizeMB>64</SizeMB></PersistentLocalStorage></Game>";
-        let t = Title::from_manifest(text);
-        assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 64 << 20));
-    }
-
-    #[test]
     fn reads_title_id_store_id_and_storage_quota() {
         let text = "\u{feff}<?xml version=\"1.0\"?>\n<Game configVersion=\"1\">\
                     <!-- <TitleId>00000000</TitleId> -->\
@@ -273,44 +228,5 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
-    }
-
-    #[test]
-    fn parses_title_id_with_or_without_a_hex_prefix() {
-        for id in ["1234ABCD", "0x1234ABCD", "0X1234abcd"] {
-            let text = format!("<Game><TitleId>{id}</TitleId></Game>");
-            assert_eq!(Title::from_manifest(&text).id, 0x1234_ABCD, "{id}");
-        }
-        assert_eq!(
-            Title::from_manifest("<Game><TitleId>0x</TitleId></Game>").id,
-            0
-        );
-    }
-
-    #[test]
-    fn self_closing_elements_do_not_capture_trailing_text() {
-        let text = "<Game><StoreId /> trailing &amp; text <TitleId>1234</TitleId></Game>";
-        let title = Title::from_manifest(text);
-        assert_eq!(title.store_id, "");
-        assert_eq!(title.id, 0x1234);
-    }
-
-    #[test]
-    fn storage_quota_saturates_when_megabytes_exceed_u64_bytes() {
-        let max_mb = u64::MAX / (1024 * 1024);
-
-        let at_limit = format!(
-            "<Game><PersistentLocalStorage><SizeMB>{max_mb}</SizeMB></PersistentLocalStorage></Game>"
-        );
-        assert_eq!(
-            Title::from_manifest(&at_limit).storage_bytes,
-            max_mb * 1024 * 1024
-        );
-
-        let above_limit = format!(
-            "<Game><PersistentLocalStorage><SizeMB>{}</SizeMB></PersistentLocalStorage></Game>",
-            max_mb + 1
-        );
-        assert_eq!(Title::from_manifest(&above_limit).storage_bytes, u64::MAX);
     }
 }

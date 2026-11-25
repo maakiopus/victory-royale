@@ -27,9 +27,8 @@
 //!   store may fall between any two reads or before both: the title's code
 //!   cannot tell which).
 //!
-//! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT` in
-//! diagnostics builds), part of the translation and so of the shader
-//! cache's key.
+//! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
+//! the translation and so of the shader cache's key.
 
 use std::collections::HashMap;
 
@@ -48,10 +47,15 @@ pub const REUSE: u32 = 4;
 pub const FACTS: u32 = 8;
 /// One read for one place within a block, while nothing is stored.
 pub const LOADS: u32 = 16;
+/// Not a pass over the module: the lowering of a first-lane read in a
+/// wave64 program run as two host waves skips the exchange that asks which
+/// half has a lane where every lane is in EXEC (`lower.rs`,
+/// `v_readfirstlane_b32`).
+pub const FIRST: u32 = 32;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE;
+pub const ALL: u32 = MODULE | FIRST;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -1176,7 +1180,7 @@ mod tests {
         m.terminate(b, Term::Ret);
         m.optimise(DEAD);
         assert_eq!(body(&m, b), 3, "the load, the add and the store");
-        m.write(false);
+        m.write();
     }
 
     #[test]
@@ -1208,7 +1212,7 @@ mod tests {
         assert_eq!(m.blocks[head].phis.len(), 1, "the counter");
         assert_eq!(body(&m, head), 2, "the step and the test");
         assert_eq!(body(&m, exit), 1);
-        m.write(false);
+        m.write();
     }
 
     #[test]
@@ -1238,7 +1242,7 @@ mod tests {
             panic!("a call");
         };
         assert_eq!(k.m.funcs[f as usize].name, "dx.op.barrier");
-        k.m.write(false);
+        k.m.write();
     }
 
     /// The operands of each store left in block `b`.
@@ -1300,7 +1304,7 @@ mod tests {
         let minus4 = m.i32(-4i32 as u32);
         let stores = stores(&m, b);
         assert_eq!(stores, [vec![x, four], vec![minus4, wide]]);
-        m.write(false);
+        m.write();
     }
 
     #[test]
@@ -1334,7 +1338,7 @@ mod tests {
         // selects are gone.
         assert_eq!(body(&m, b), 6);
         assert_eq!(stores(&m, b), [[xy, p]]);
-        m.write(false);
+        m.write();
     }
 
     /// entry: `c = x < y`, branch to `then` or `other`, which join.
@@ -1404,7 +1408,7 @@ mod tests {
         assert_eq!(body(&m, then), 2);
         assert_eq!(body(&m, other), 2);
         assert_eq!(body(&m, join), 2);
-        m.write(false);
+        m.write();
     }
 
     #[test]
@@ -1451,7 +1455,7 @@ mod tests {
         assert_eq!(stores(&m, other), [[y, y]]);
         assert_eq!(body(&m, join), 2);
         let _ = both;
-        m.write(false);
+        m.write();
 
         // Both terms of an `and` that held hold behind it.
         let Diamond {
@@ -1485,7 +1489,7 @@ mod tests {
         m.optimise(FOLD | FACTS);
         assert_eq!(stores(&m, inner), [[x, x]]);
         assert_eq!(body(&m, out), 2);
-        m.write(false);
+        m.write();
     }
 
     #[test]
@@ -1526,7 +1530,7 @@ mod tests {
         };
         assert_eq!(incoming, &vec![(x, meet), (y, other)]);
         let _ = b;
-        m.write(false);
+        m.write();
     }
 
     #[test]
@@ -1582,7 +1586,7 @@ mod tests {
             super::tests::stores(&m, then),
             [vec![below, below], vec![top, top]]
         );
-        m.write(false);
+        m.write();
     }
 
     #[test]
@@ -1617,7 +1621,7 @@ mod tests {
         let stores = stores(&m, join);
         assert_eq!(stores[0], [x, p]);
         assert_eq!(stores[1][1], p);
-        m.write(false);
+        m.write();
     }
 
     // ---- the passes against an interpreter, on random programs ----
@@ -2123,7 +2127,7 @@ mod tests {
                     let left: usize = m.blocks.iter().map(|b| b.body.len() + b.phis.len()).sum();
                     removed += written - left;
                 }
-                m.write(false);
+                m.write();
             }
         }
         // The programs are of the wasteful kind: the passes find work.

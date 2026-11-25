@@ -8,8 +8,7 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock, ProviderData};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string,
-    query_interface, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
 };
 
 /// The user provider.
@@ -76,14 +75,13 @@ fn found(found: bool, out: *mut Handle) -> HRESULT {
     }
 }
 
-pub static OBJECT: Object = Object::with_iids("user", &VTABLE, &[IID, PROVIDER]);
-pub static GAMERTAG_OBJECT: Object =
-    Object::with_iids("user gamertag", &GAMERTAG_VTABLE, &[GAMERTAG_IID]);
-pub static DEVICE_OBJECT: Object = Object::with_iids("user devices", &DEVICE_VTABLE, &[DEVICE_IID]);
+pub static OBJECT: Object = Object::new("user", &VTABLE);
+pub static GAMERTAG_OBJECT: Object = Object::new("user gamertag", &GAMERTAG_VTABLE);
+pub static DEVICE_OBJECT: Object = Object::new("user devices", &DEVICE_VTABLE);
 
 pub const INTERFACES: &[Interface] = &[
     (PROVIDER, IID, &OBJECT),
-    // The title asks with the provider's id; its thunks call
+    // The title (2026) asks with the provider's id; its thunks call
     // the same slots with the same arguments (0x108/0x110 change events).
     (PROVIDER, PROVIDER, &OBJECT),
     (PROVIDER, GAMERTAG_IID, &GAMERTAG_OBJECT),
@@ -96,7 +94,7 @@ extern "system" fn duplicate(_: This, _: Handle, out: *mut Handle) -> HRESULT {
 }
 extern "system" fn close(_: This, _: Handle) {}
 extern "system" fn compare(_: This, a: Handle, b: Handle) -> i32 {
-    a.addr().cmp(&b.addr()) as i32
+    i32::from(a != b)
 }
 
 /// The async provider for adding a user: done at once, the result is a
@@ -233,34 +231,7 @@ extern "system" fn token_async(
         url = text(url).unwrap_or_default(),
         "token and signature: offline"
     );
-    // Report success with an empty token and signature rather than
-    // FAILED_TO_GET_TOKEN. The title's auth path only initialises the object it later
-    // dereferences when this call completes successfully; with the failure it took a null
-    // read in its account init right after XUserAddAsync (issue #348). Nothing is contacted:
-    // the URL is never opened and the offline user is unchanged.
-    xasync::finished_with(block, (&raw const TOKEN).cast(), Ok(empty_token()))
-}
-
-/// `XUserGetTokenAndSignatureData`, at the start of the result buffer; its
-/// strings follow it in the same buffer.
-#[repr(C)]
-struct TokenData {
-    /// Bytes of `token`, its NUL included.
-    token_size: usize,
-    signature_size: usize,
-    token: *const c_char,
-    signature: *const c_char,
-}
-
-/// The result of an offline token call: the header with sizes for an empty
-/// token and signature (one NUL each), which follow it. The pointers are
-/// set in [`token_result`], once the bytes are in the title's buffer.
-fn empty_token() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(size_of::<TokenData>() + 2);
-    bytes.extend(1usize.to_le_bytes());
-    bytes.extend(1usize.to_le_bytes());
-    bytes.resize(size_of::<TokenData>() + 2, 0);
-    bytes
+    xasync::finished(block, (&raw const TOKEN).cast(), FAILED_TO_GET_TOKEN)
 }
 extern "system" fn token_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
     xasync::XAsyncGetResultSize(block, out)
@@ -270,26 +241,10 @@ extern "system" fn token_result(
     block: *mut AsyncBlock,
     size: usize,
     buffer: *mut c_void,
-    data: *mut *const TokenData,
+    _data: *mut *const c_void,
     used: *mut usize,
 ) -> HRESULT {
-    let hr = xasync::XAsyncGetResult(block, (&raw const TOKEN).cast(), size, buffer, used);
-    if hr < 0 {
-        return hr;
-    }
-    // `XAsyncGetResult` succeeded, so `buffer` holds the whole result.
-    let header = buffer.cast::<TokenData>();
-    let strings = buffer.cast::<c_char>().wrapping_add(size_of::<TokenData>());
-    // SAFETY: the title's buffer holds the header and both strings (the
-    // size checked above); it need not be aligned.
-    unsafe {
-        (&raw mut (*header).token).write_unaligned(strings);
-        (&raw mut (*header).signature).write_unaligned(strings.add(1));
-    }
-    if !data.is_null() {
-        put(data, header.cast_const());
-    }
-    hr
+    xasync::XAsyncGetResult(block, (&raw const TOKEN).cast(), size, buffer, used)
 }
 
 /// The user never changes and no device is ever associated, so these
@@ -312,26 +267,16 @@ extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Hand
     USER_NOT_FOUND
 }
 
-/// 1: one offline local user can be signed in at a time.
-///
-/// This slot was a `missing` stub (E_NOTIMPL, no output written). The title calls it during
-/// its account init right after XUserAddAsync and dereferences the output regardless, which
-/// is the null read of issue #348 (its second suggestion). `XUserGetMaxUsers` takes only the
-/// output pointer, so the method is `(this, maxUsers)`: no user handle.
-extern "system" fn get_max_users(_: This, out: *mut u32) -> HRESULT {
-    put(out, 1)
-}
-
-// Unset slots (no title seen calls them): gamer pictures,
+// Unset slots (no title seen calls them): maximum users, gamer pictures,
 // the UTF-16 token calls, issue resolution.
 static VTABLE: Methods<35> = Methods([
-    query_interface as *const (),          // 0x00 QueryInterface
+    missing::<0> as *const (),             // 0x00 QueryInterface
     add_ref as *const (),                  // 0x08 AddRef
     add_ref as *const (),                  // 0x10 Release: the object is static
     duplicate as *const (),                // 0x18
     close as *const (),                    // 0x20
     compare as *const (),                  // 0x28
-    get_max_users as *const (),            // 0x30 maximum users
+    missing::<6> as *const (),             // 0x30 maximum users
     add_async as *const (),                // 0x38
     add_result as *const (),               // 0x40
     get_local_id as *const (),             // 0x48
@@ -363,14 +308,14 @@ static VTABLE: Methods<35> = Methods([
 ]);
 
 static GAMERTAG_VTABLE: Methods<4> = Methods([
-    query_interface as *const (),
+    missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
     get_gamertag as *const (), // 0x18
 ]);
 
 static DEVICE_VTABLE: Methods<6> = Methods([
-    query_interface as *const (),
+    missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
     find_for_device as *const (), // 0x18
@@ -401,16 +346,6 @@ mod tests {
                 assert_eq!(&name[..used], expected, "component {component}");
             }
         }
-    }
-
-    /// `XUserGetMaxUsers(uint32_t*)`: the output is the first argument after
-    /// `this`, with no user handle before it.
-    #[test]
-    fn maximum_users_writes_through_the_first_argument() {
-        type MaxUsers = extern "system" fn(This, *mut u32) -> HRESULT;
-        let mut max = 0;
-        assert_eq!(slot::<MaxUsers>(&OBJECT, 0x30)(&OBJECT, &mut max), S_OK);
-        assert_eq!(max, 1);
     }
 
     #[test]
@@ -482,52 +417,9 @@ mod tests {
             ),
             S_OK
         );
-        // Offline, the token call completes with an empty token rather than
-        // FAILED_TO_GET_TOKEN (the title only initialises its auth object on
-        // success; see token_async).
-        assert_eq!(xasync::XAsyncGetStatus(&mut block, true), S_OK);
-        let mut size = 0;
-        assert_eq!(token_size(this, &mut block, &mut size), S_OK);
-        assert_eq!(size, size_of::<TokenData>() + 2);
-        let mut buffer = vec![0xAAu8; size];
-        let (mut data, mut used) = (std::ptr::null(), 0);
         assert_eq!(
-            token_result(
-                this,
-                &mut block,
-                size,
-                buffer.as_mut_ptr().cast(),
-                &mut data,
-                &mut used
-            ),
-            S_OK
+            xasync::XAsyncGetStatus(&mut block, true),
+            FAILED_TO_GET_TOKEN
         );
-        assert_eq!((data.cast::<u8>(), used), (buffer.as_ptr(), size));
-        // SAFETY: `data` points at the header in `buffer`, which is alive.
-        let (token, signature) = unsafe {
-            let d = data.read_unaligned();
-            assert_eq!((d.token_size, d.signature_size), (1, 1));
-            (
-                std::ffi::CStr::from_ptr(d.token),
-                std::ffi::CStr::from_ptr(d.signature),
-            )
-        };
-        assert!(token.is_empty() && signature.is_empty());
-    }
-
-    #[test]
-    fn xuser_compare_is_antisymmetric() {
-        type Compare = extern "system" fn(This, Handle, Handle) -> i32;
-        let this: This = &OBJECT;
-        let cmp = slot::<Compare>(&OBJECT, 0x28);
-        let u = user();
-        let null = std::ptr::null();
-        assert_eq!(cmp(this, u, u), 0);
-        assert_eq!(cmp(this, null, null), 0);
-        let null_vs_user = cmp(this, null, u);
-        let user_vs_null = cmp(this, u, null);
-        assert!(null_vs_user < 0);
-        assert!(user_vs_null > 0);
-        assert_eq!(null_vs_user, -user_vs_null);
     }
 }
