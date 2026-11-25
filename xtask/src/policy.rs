@@ -14,7 +14,7 @@ const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh", "py",
+    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -161,6 +161,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             | "scripts/hardware-test/run-test.py"
             | "scripts/hardware-test/prepare.py"
             | "tests/hardware-test.py"
+            | "tools/linux-sweep/analyze.py"
     ) || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
@@ -264,6 +265,7 @@ mod tests {
         assert!(check("tests/metal/generate.py", b"import struct").is_empty());
         assert!(check("tests/metal/run.py", b"import subprocess").is_empty());
         assert!(check("tests/metal/probe.swift", b"import Metal").is_empty());
+        assert!(check("tools/linux-sweep/analyze.py", b"import re").is_empty());
 
         assert!(!check("other.py", b"pass").is_empty());
         assert!(!check("other.swift", b"import Metal").is_empty());
