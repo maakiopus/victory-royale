@@ -34,6 +34,12 @@ set VICTORY_CAPTURE_WORLD=0,3
 "$ZEXE" run "$GAME" --execute --console series-x > Z:\\tmp\\opencode\\sweep-$LABEL\\app.log 2>&1
 EOF
 
+# Optional extra VICTORY_* settings for a diagnostic sweep, e.g.
+# SWEEP_EXTRA='set VICTORY_SHADER_OPT=0'. Inserted before the run line.
+if [ -n "${SWEEP_EXTRA:-}" ]; then
+    { head -3 "$BAT"; printf '%s\n' "$SWEEP_EXTRA"; tail -n +4 "$BAT"; } > "$BAT.tmp" && mv "$BAT.tmp" "$BAT"
+fi
+
 export PROTONPATH="$PROTON"
 export STEAM_COMPAT_INSTALL_PATH=${STEAM_COMPAT_INSTALL_PATH:-$HOME/.local/share/Steam/steamapps/common/victory-run}
 export STEAM_COMPAT_LIBRARY_PATHS=${STEAM_COMPAT_LIBRARY_PATHS:-$HOME/.local/share/Steam/steamapps}
