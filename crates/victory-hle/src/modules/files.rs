@@ -547,16 +547,23 @@ pub extern "system" fn ReadFile(
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
     let total = size.saturating_mul(count);
-    if buffer.is_null() || total == 0 {
+    if buffer.is_null() || stream.is_null() || total == 0 {
         // The CRT's own checks and answer (EINVAL, or nothing to read).
         return read(buffer, size, count, stream);
     }
     const CHUNK: usize = 1 << 20;
     let mut beside = vec![0u8; total.min(CHUNK)];
+    let lock = host!("ucrtbase.dll", "_lock_file": extern "C" fn(File));
+    let unlock = host!("ucrtbase.dll", "_unlock_file": extern "C" fn(File));
+    let read_chunk =
+        host!("ucrtbase.dll", "_fread_nolock": extern "C" fn(*mut u8, usize, usize, File) -> usize);
+    // The CRT serializes a complete fread on this FILE, including every
+    // chunk copied into the title's destination.
+    lock(stream);
     let mut done = 0;
     while done < total {
         let want = (total - done).min(CHUNK);
-        let n = read(beside.as_mut_ptr(), 1, want, stream);
+        let n = read_chunk(beside.as_mut_ptr(), 1, want, stream);
         if n > 0 {
             victory_gpu::kernel_will_write(buffer as usize + done, n);
             // SAFETY: the caller's buffer holds `size * count` bytes, and
@@ -568,6 +575,7 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
             break;
         }
     }
+    unlock(stream);
     done / size
 }
 
@@ -765,6 +773,52 @@ mod tests {
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
+    }
+
+    #[test]
+    fn simultaneous_fread_calls_each_take_one_contiguous_region() {
+        use std::io::Write;
+        use std::sync::{Arc, Barrier};
+        const MIB: usize = 1 << 20;
+        const HALF: usize = 24;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sequence.bin");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for n in 0..HALF * 2 {
+            file.write_all(&vec![n as u8; MIB]).unwrap();
+        }
+        drop(file);
+        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
+        for _ in 0..3 {
+            let stream = _wfopen(w(&path.to_string_lossy()).as_ptr(), w("rb").as_ptr());
+            assert!(!stream.is_null());
+            let addr = stream as usize;
+            let start = Arc::new(Barrier::new(2));
+            let read = || {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    let mut out = vec![0; HALF * MIB];
+                    start.wait();
+                    assert_eq!(
+                        fread(out.as_mut_ptr(), 1, out.len(), addr as File),
+                        out.len()
+                    );
+                    out.chunks(MIB).map(|block| block[0]).collect::<Vec<_>>()
+                })
+            };
+            let a = read();
+            let b = read();
+            let mut results = [a.join().unwrap(), b.join().unwrap()];
+            fclose(stream);
+            results.sort();
+            assert_eq!(
+                results,
+                [
+                    (0..HALF as u8).collect::<Vec<_>>(),
+                    (HALF as u8..(HALF * 2) as u8).collect()
+                ]
+            );
+        }
     }
 
     #[test]
