@@ -483,7 +483,8 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
         buffer, size, count, stream,
     );
     victory_gpu::kernel_wrote(buffer as usize, size.saturating_mul(count));
-    n}
+    n
+}
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
     match narrow(path) {
@@ -702,7 +703,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.bin");
         // Over two chunks, and not a whole number of 3-byte items.
-        let bytes: Vec<u8> = (0..(5 << 19) + 1).map(|i| (i * 7 + i / 251) as u8).collect();
+        let bytes: Vec<u8> = (0..(5 << 19) + 1)
+            .map(|i| (i * 7 + i / 251) as u8)
+            .collect();
         std::fs::write(&path, &bytes).unwrap();
         let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
         let open = || {
@@ -716,8 +719,15 @@ mod tests {
         let mut out = vec![0xaau8; bytes.len() + 64];
         let items = fread(out.as_mut_ptr(), 3, out.len() / 3, f);
         assert_eq!(items, bytes.len() / 3);
-        assert_eq!(&out[..bytes.len()], &bytes[..], "the partial last item's bytes too");
-        assert!(out[bytes.len()..].iter().all(|&b| b == 0xaa), "nothing past what was read");
+        assert_eq!(
+            &out[..bytes.len()],
+            &bytes[..],
+            "the partial last item's bytes too"
+        );
+        assert!(
+            out[bytes.len()..].iter().all(|&b| b == 0xaa),
+            "nothing past what was read"
+        );
         fclose(f);
 
         // Exact reads continue where the last one stopped.

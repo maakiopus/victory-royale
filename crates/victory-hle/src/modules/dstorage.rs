@@ -1068,7 +1068,8 @@ fn into_destination(
             );
             return Err(E_INVALIDARG);
         }
-        return Ok(());    }
+        return Ok(());
+    }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
     // which holds at least `len` bytes from `offset`.
