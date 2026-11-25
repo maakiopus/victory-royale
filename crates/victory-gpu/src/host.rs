@@ -6509,6 +6509,9 @@ fn caption(figures: &str, up: Duration) -> String {
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
+    /// All completed present intervals in the reporting window, summarized so
+    /// stalls between the once-a-second average points are not lost.
+    frame_times: crate::frame_times::FrameTimes,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -6529,6 +6532,7 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            frame_times: Default::default(),
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -6544,8 +6548,25 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        let now = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
+        let interval = self.frame_times.previous_interval(now);
+        if let Some(s) = self.frame_times.present(now) {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            tracing::info!(
+                "present intervals: {} frames, mean {:.2} ms, median {:.2} ms, p95 {:.2} ms, \
+                 longest {:.2} ms, {} over 100 ms, {} over 1 s",
+                s.intervals,
+                s.mean_ms,
+                ms(s.median),
+                ms(s.p95),
+                ms(s.longest),
+                s.over_100ms,
+                s.over_1s
+            );
+        }
+        #[cfg(feature = "diagnostics")]
+        tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), interval_ms = interval.as_secs_f64() * 1000.0, "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
@@ -6553,7 +6574,7 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
-        let elapsed = self.since.elapsed();
+        let elapsed = now - self.since;
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
@@ -6943,7 +6964,12 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let hr = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if !hr.is_ok() {
+                // A failed present is not a frame the user saw. Start a fresh
+                // interval instead of charging the gap in the next summary.
+                p.meter.frame_times.interrupted();
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

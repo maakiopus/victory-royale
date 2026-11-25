@@ -32,6 +32,13 @@ impl FrameTimes {
         self.previous = None;
     }
 
+    /// How long the present interval ending at `now` took, without ending the
+    /// reporting window. Zero for the first present after an interruption.
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(crate) fn previous_interval(&self, now: Instant) -> Duration {
+        self.previous.map_or(Duration::ZERO, |p| now - p)
+    }
+
     pub(crate) fn present(&mut self, now: Instant) -> Option<Summary> {
         let interval = now - self.previous.replace(now)?;
         self.intervals.push(interval);
@@ -132,5 +139,25 @@ mod tests {
                 assert_eq!(result, None);
             }
         }
+    }
+
+    #[test]
+    fn previous_interval_reports_the_open_interval_without_ending_it() {
+        let mut times = FrameTimes::default();
+        let ms = Duration::from_millis;
+        let mut now = Instant::now();
+        assert_eq!(times.previous_interval(now), ms(0));
+        assert_eq!(times.present(now), None);
+        assert_eq!(times.previous_interval(now), ms(0));
+        now += ms(37);
+        assert_eq!(times.previous_interval(now), ms(37));
+        // Reporting the interval does not consume it or end the window.
+        assert_eq!(times.previous_interval(now), ms(37));
+        assert_eq!(times.present(now).map(|s| s.intervals), None);
+        now += ms(5010);
+        assert_eq!(times.previous_interval(now), ms(5010));
+        let s = times.present(now).unwrap();
+        assert_eq!(s.intervals, 2);
+        assert_eq!(s.longest, ms(5010));
     }
 }
