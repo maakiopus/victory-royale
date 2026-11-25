@@ -64,6 +64,7 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("emit/waterfall_tests.rs"),
         include_str!("emit/wave.rs"),
         include_str!("emit/wave64_tests.rs"),
+        include_str!("emit/wave_mask_tests.rs"),
         include_str!("gfx10/fields.rs"),
         include_str!("gfx10/mod.rs"),
         include_str!("gfx10/opcodes.rs"),

@@ -349,6 +349,13 @@ impl Module {
         V::Func(i)
     }
 
+    /// Whether the module declares a function of this name: how a test sees
+    /// which `dx.op` intrinsics a lowering reached for.
+    #[cfg(test)]
+    pub fn declares(&self, name: &str) -> bool {
+        self.func_ids.contains_key(name)
+    }
+
     /// An external global of type `ty` in address space `space` (DXIL
     /// declares thread-group shared memory this way).
     pub fn global(&mut self, name: &str, ty: Ty, space: u32) -> V {

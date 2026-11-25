@@ -103,6 +103,8 @@ mod waterfall_tests;
 mod wave;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(test)]
+mod wave_mask_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};

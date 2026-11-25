@@ -65,6 +65,10 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether a first-lane read gives a helper lane its own value
+    /// ([`Lower::helper_reads_own`]).
+    #[cfg(test)]
+    pub helper_lane_own: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2366,6 +2370,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            helper_lane_own: self.s.m.declares("dx.op.isHelperLane.i1"),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4511,6 +4517,30 @@ impl<'a> Lower<'a> {
         let lane = self.s.m.select(c, any, lane, me);
         let at = self.read_lane(x, lane);
         (self.s.m.select(c, any, at, first), any)
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader: a
+    /// helper lane takes its own value instead.
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes holding
+    /// that value, take them out of EXEC) serves helper lanes too. On the
+    /// host, wave operations leave helper lanes out (DXIL before
+    /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
+    /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
+    /// loop runs to [`LOOP_LIMIT`] in every one of them, which cost draws of
+    /// 0.3 to 1.3 s each and then DEVICE_HUNG. With its own value a helper
+    /// lane matches in the first pass and leaves; what it computes only
+    /// feeds derivatives, and its stores are dropped already.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -7751,6 +7781,7 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
