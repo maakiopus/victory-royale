@@ -78,6 +78,24 @@ def analyse(log: Path, captures: Path) -> int:
     pngs = sorted(captures.glob("*.png")) if captures.exists() else []
     big = [p for p in pngs if p.stat().st_size > 500_000]
 
+    # A large PNG can still be a black loading screen. Measure luminance of
+    # the biggest captures so the sweep flags "reachable but renders nothing".
+    brightness: list[tuple[str, float]] = []
+    try:
+        from PIL import Image, ImageStat
+
+        for p in sorted(big, key=lambda x: x.stat().st_size, reverse=True)[:8]:
+            mean = ImageStat.Stat(Image.open(p).convert("L")).mean[0]
+            brightness.append((p.name, mean))
+    except ImportError:
+        pass
+    if brightness:
+        means = [m for _, m in brightness]
+        print(f"capture_luminance min={min(means):.1f} max={max(means):.1f} "
+              f"bright_ge80={sum(m >= 80 for m in means)}/{len(means)}")
+        print(f"  darkest={min(brightness, key=lambda x: x[1])} "
+              f"brightest={max(brightness, key=lambda x: x[1])}")
+
     print(f"log_lines={len(lines)} captures={len(pngs)} nonblank={len(big)}")
     print(f"world_marker={world or 'NONE'}")
     print(f"faults={faults} indirect_drops={indirect} depth_plane_drops={depth}")
@@ -96,7 +114,11 @@ def analyse(log: Path, captures: Path) -> int:
               f"over1s={last['over1s']:.0f}")
 
     # A sweep fails if anything that should render is missing or errors appear.
-    ok = bool(world) and not faults and not shader_drops and not black_frames
+    dark_screen = bool(brightness) and all(m < 80 for _, m in brightness)
+    ok = (bool(world) and not faults and not shader_drops and not black_frames
+          and not dark_screen)
+    if dark_screen:
+        print("DARK_SCREEN: every large capture is a dark loading screen, not the world")
     print(f"VERDICT={'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
