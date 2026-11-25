@@ -466,7 +466,7 @@ pub(crate) fn dump_after(
         };
         // SAFETY: a live resource.
         let d = unsafe { copy.texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1 || !flat_dimension(d.Dimension) {
             continue;
         }
         // In the list's own account of the texture's state: the next draw
@@ -497,16 +497,18 @@ pub(crate) fn dump_after(
                     return;
                 }
                 let pitch = f.RowPitch as usize;
-                let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+                let height = footprint_rows(&f);
+                let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * height as usize);
+                tracing::info!(name, "texture after a draw");
                 match to_rgba(
                     f.Format.0 as u32,
                     f.Width as usize,
-                    f.Height as usize,
+                    height as usize,
                     pitch,
                     rows,
                 ) {
                     Some(rgba) => {
-                        save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba)
+                        save_as(&name, f.Width, height, f.Width as usize * 4, false, &rgba)
                     }
                     None => tracing::info!(
                         format = f.Format.0,
@@ -756,7 +758,7 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1 || !flat_dimension(d.Dimension) {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -824,7 +826,8 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let height = footprint_rows(&f);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * height as usize);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
         if matches!(d.Format.0, 44..=47) {
@@ -845,18 +848,19 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
+        let name = format!(
+            "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+            d.Width, d.Height, d.Format.0
+        );
+        tracing::info!(name, "target at the frame's end");
         if let Some(rgba) = to_rgba(
             f.Format.0 as u32,
             f.Width as usize,
-            f.Height as usize,
+            height as usize,
             pitch,
             rows,
         ) {
-            let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            save_as(&name, f.Width, height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
@@ -1066,7 +1070,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .filter(|v| v.iter().any(|c| c.is_finite() && *c > low))
         .count();
     let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
-    tracing::info!(format, low, high, nonzero_percent, "target values");
+    let mean = channel_means(&values);
+    tracing::info!(format, low, high, nonzero_percent, ?mean, "target values");
     // Small float colour targets (the 1x1 luminance and exposure targets):
     // every texel's four channels as numbers. The picture has no alpha and
     // eight bits a channel.
@@ -1154,6 +1159,38 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
+}
+
+/// Whether [`dump_targets`] and [`dump_after`] save textures of this
+/// dimension: 2D, and 3D (colour grading tables) as their slices one under
+/// the other.
+fn flat_dimension(dimension: D3D12_RESOURCE_DIMENSION) -> bool {
+    matches!(
+        dimension,
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D
+    )
+}
+
+/// The rows of a placed footprint: its slices follow each other a row
+/// pitch times the height apart.
+fn footprint_rows(f: &D3D12_SUBRESOURCE_FOOTPRINT) -> u32 {
+    f.Height * f.Depth.max(1)
+}
+
+/// The mean of each of the three channels over the finite values: a
+/// channel one pass loses shows as a mean far below the others.
+fn channel_means(values: &[[f32; 3]]) -> [f32; 3] {
+    let mut sum = [0f64; 3];
+    let mut count = [0u32; 3];
+    for v in values {
+        for k in 0..3 {
+            if v[k].is_finite() {
+                sum[k] += f64::from(v[k]);
+                count[k] += 1;
+            }
+        }
+    }
+    [0, 1, 2].map(|k| (sum[k] / f64::from(count[k].max(1))) as f32)
 }
 
 /// Pixels per side of the grid [`probe`] reads.

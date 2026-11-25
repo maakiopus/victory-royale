@@ -4,23 +4,31 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So active records are copied and clamped
 //! on the GPU into a device-local scratch buffer, just before execution, by a
-//! compute shader of ours (HLSL compiled by the system's compiler; a 5.1
-//! shader with its root signature inside), leaving the title's argument and
-//! count buffers untouched.
+//! compute shader of ours (HLSL compiled by the system's compiler, with a
+//! root signature serialized here), leaving the title's argument and count
+//! buffers untouched.
 //!
-//! When a count buffer is given, threads at or past `min(max, count)` return
-//! immediately without charging the list's budget or reading uninitialized
-//! tail slots. Each list has a budget (2^27 vertex instances or threads,
-//! groups counted as 64 threads, mesh groups as 128): active records past it
-//! run empty, saturating without 32-bit wraparound so a list of thousands of
-//! garbage records cannot run for seconds either.
+//! The shader uses no atomics, reads its buffers as dwords and embeds no
+//! root signature: Proton's `d3dcompiler_47` (vkd3d-shader) defines no
+//! `Load` or `Interlocked*` method on a `RWByteAddressBuffer` and embeds
+//! none, and a clamp that does not compile drops every
+//! indirect execution (the world's geometry; with nothing lit the exposure
+//! climbs to its most and only the bloom of lamps is left, without its
+//! blue). One group of 64 threads walks the records 64 at a time: each
+//! thread clamps one record, then the first charges the budget for the 64 in
+//! order, from group-shared memory.
+//!
+//! When a count buffer is given, records at or past `min(max, count)` are
+//! not read, charged or written. Each list has a budget (2^27 vertex
+//! instances or threads, groups counted as 64 threads, mesh groups as 128):
+//! active records past it run empty, saturating without 32-bit wraparound so
+//! a list of thousands of garbage records cannot run for seconds either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
@@ -28,7 +36,6 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -41,120 +48,154 @@ cbuffer Record : register(b0) {
     uint has_count;
     uint count_offset;
 };
-ByteAddressBuffer src_args : register(t0);
-ByteAddressBuffer count_buf : register(t1);
-RWByteAddressBuffer dst_args : register(u0);
+// Buffers as dwords (byte offsets are multiples of 4): Proton's compiler
+// reads no byte-address UAV.
+StructuredBuffer<uint> src_args : register(t0);
+StructuredBuffer<uint> count_buf : register(t1);
+RWStructuredBuffer<uint> dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
-RWByteAddressBuffer budget : register(u1);
+// records run empty. Words 1 and 2: the largest group count a mesh record
+// asked for, and the groups asked in all (diagnostics).
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 static const uint SPLIT = 2;
-[RootSignature(RS)]
+static const uint LANES = 64;
+// Per thread of the current 64 records: its cost, the mesh groups it asked
+// for, and whether it is over the budget.
+groupshared uint costs[LANES];
+groupshared uint asks[LANES];
+groupshared uint overs[LANES];
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
+void main(uint3 thread : SV_GroupThreadID) {
+    uint lane = thread.x;
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     bool split = (has_count & 4u) != 0;
     if ((has_count & 1u) != 0) {
-        eff_count = min(eff_count, count_buf.Load(count_offset));
+        eff_count = min(eff_count, count_buf[count_offset / 4u]);
     }
-    if (id.x >= eff_count) return;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
-    uint cost;
-    uint2 draw_counts = uint2(0, 0);
-    uint3 groups = uint3(0, 0, 0);
-    if (kind <= 1) {
-        // Draws: vertex or index count, then instances.
-        uint2 asked = src_args.Load2(src_at);
-        if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
-            asked = uint2(0, 0);
-        }
-        uint count = min(asked.x, 1u << 24);
-        uint instances = min(asked.y, (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        draw_counts = uint2(count, instances);
-    } else if (kind == 2) {
-        uint3 asked = src_args.Load3(src_at);
-        uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
-        // In parts: one dimension, and not the garbage of an argument
-        // nothing wrote.
-        if (split && g.y <= 1u && g.z <= 1u && asked.x <= SPLIT * 65535u) {
-            g.x = asked.x;
-        }
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
-        }
-        cost = g.x * g.y * g.z * 64u;
-        groups = g;
-    } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = src_args.Load3(src_at);
-        // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (the title leaves all
-        // ones there): empty, and not counted below either.
-        if (ahead && g.x > 65535u) {
-            g = uint3(0, 0, 0);
-        }
-        // Diagnostics, in the budget buffer's next words: the largest
-        // group count a mesh record asked for, and the groups asked in all.
-        // FXC's SM 5.1 byte-address buffers have no atomic maximum, so use a
-        // compare/exchange loop, as the budget reservation just below does.
-        uint was;
-        budget.InterlockedAdd(4, 0u, was);
-        [allow_uav_condition]
-        while (was < g.x) {
-            uint prev;
-            budget.InterlockedCompareExchange(4, was, g.x, prev);
-            if (prev == was) break;
-            was = prev;
-        }
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128u;
-        groups = g;
+    // The first thread's running totals.
+    uint spent = 0;
+    uint largest = 0;
+    uint asked_all = 0;
+    if (lane == 0) {
+        spent = budget[0];
+        largest = budget[1];
+        asked_all = budget[2];
     }
-    bool over = false;
-    if (cost > 0) {
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
-        }
-        over = before >= BUDGET || BUDGET - before < cost;
-    }
-    if (kind <= 1) {
-        if (over) {
-            draw_counts = uint2(0, 0);
-        }
-        dst_args.Store2(dst_at, draw_counts);
-        for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
-        }
-    } else {
-        if (over) {
-            groups = uint3(0, 0, 0);
-        }
-        if (split) {
-            for (uint part = 0; part < SPLIT; part++) {
-                uint before = part * 65535u;
-                uint x = groups.x > before ? min(groups.x - before, 65535u) : 0u;
-                dst_args.Store3(dst_at + part * 12u, uint3(x, groups.yz));
+    // Bounded by the constant, not the count read from memory: every
+    // thread meets the barriers (FXC takes no barrier in a loop a loaded
+    // value bounds). Past the count the threads do nothing.
+    for (uint first = 0; first < records; first += LANES) {
+        uint r = first + lane;
+        bool active = r < eff_count;
+        // Dword indices of the record.
+        uint src_at = (args_offset + r * stride) / 4u;
+        uint dst_at = r * stride / 4u;
+        uint cost = 0;
+        uint asked_mesh = 0;
+        uint2 draw_counts = uint2(0, 0);
+        uint3 groups = uint3(0, 0, 0);
+        if (active) {
+            if (kind <= 1) {
+                // Draws: vertex or index count, then instances.
+                uint2 asked = uint2(src_args[src_at], src_args[src_at + 1u]);
+                if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
+                    asked = uint2(0, 0);
+                }
+                uint count = min(asked.x, 1u << 24);
+                uint instances = min(asked.y, (1u << 26) / max(count, 1u));
+                cost = count * instances;
+                draw_counts = uint2(count, instances);
+            } else if (kind == 2) {
+                uint3 asked = uint3(src_args[src_at], src_args[src_at + 1u], src_args[src_at + 2u]);
+                uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
+                // In parts: one dimension, and not the garbage of an
+                // argument nothing wrote.
+                if (split && g.y <= 1u && g.z <= 1u && asked.x <= SPLIT * 65535u) {
+                    g.x = asked.x;
+                }
+                // x * y fits 32 bits; the whole count may not.
+                if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                    g = uint3(0, 0, 0);
+                }
+                cost = g.x * g.y * g.z * 64u;
+                groups = g;
+            } else {
+                // Mesh dispatches: the console's are one-dimensional.
+                uint3 g = uint3(src_args[src_at], src_args[src_at + 1u], src_args[src_at + 2u]);
+                // Ahead of its draw, a record over the most a dispatch runs
+                // is a slot the title has not filled (the title leaves all
+                // ones there): empty, and not counted as asked for either.
+                if (ahead && g.x > 65535u) {
+                    g = uint3(0, 0, 0);
+                }
+                asked_mesh = g.x;
+                g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+                cost = g.x * g.y * g.z * 128u;
+                groups = g;
             }
-            return;
         }
-        dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        costs[lane] = cost;
+        asks[lane] = asked_mesh;
+        GroupMemoryBarrierWithGroupSync();
+        // The budget is charged in record order, saturating at BUDGET.
+        if (lane == 0) {
+            for (uint k = 0; k < LANES && first + k < eff_count; k++) {
+                uint c = costs[k];
+                largest = max(largest, asks[k]);
+                asked_all += min(asks[k], 1u << 24);
+                uint over = 0;
+                if (c > 0) {
+                    over = (spent >= BUDGET || BUDGET - spent < c) ? 1u : 0u;
+                    if (spent < BUDGET) {
+                        spent = (BUDGET - spent <= c) ? BUDGET : (spent + c);
+                    }
+                }
+                overs[k] = over;
+            }
         }
+        GroupMemoryBarrierWithGroupSync();
+        if (active) {
+            bool over = overs[lane] != 0;
+            if (kind <= 1) {
+                if (over) {
+                    draw_counts = uint2(0, 0);
+                }
+                dst_args[dst_at] = draw_counts.x;
+                dst_args[dst_at + 1u] = draw_counts.y;
+                for (uint w = 2u; w < stride / 4u; w++) {
+                    dst_args[dst_at + w] = src_args[src_at + w];
+                }
+            } else {
+                if (over) {
+                    groups = uint3(0, 0, 0);
+                }
+                if (split) {
+                    for (uint part = 0; part < SPLIT; part++) {
+                        uint before = part * 65535u;
+                        uint x = groups.x > before ? min(groups.x - before, 65535u) : 0u;
+                        dst_args[dst_at + part * 3u] = x;
+                        dst_args[dst_at + part * 3u + 1u] = groups.y;
+                        dst_args[dst_at + part * 3u + 2u] = groups.z;
+                    }
+                } else {
+                    dst_args[dst_at] = groups.x;
+                    dst_args[dst_at + 1u] = groups.y;
+                    dst_args[dst_at + 2u] = groups.z;
+                    for (uint w = 3u; w < stride / 4u; w++) {
+                        dst_args[dst_at + w] = src_args[src_at + w];
+                    }
+                }
+            }
+        }
+    }
+    if (lane == 0) {
+        budget[0] = spent;
+        budget[1] = largest;
+        budget[2] = asked_all;
     }
 }
 "#;
@@ -188,52 +229,94 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
-    unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+    let code = crate::host::compile(SOURCE, s!("main"), s!("cs_5_0")).inspect_err(|_| {
+        tracing::warn!("argument clamp: the system's compiler refused it (above)");
+    })?;
+    let root = clamp_root(device)?;
+    // SAFETY: the bytecode and root signature live through the call.
+    let pso = unsafe {
+        device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
             },
             ..Default::default()
-        })?;
-        Ok(Clamp { root, pso })
+        })?
+    };
+    Ok(Clamp { root, pso })
+}
+
+/// The clamp's root signature: six constants (`b0`), the arguments and the
+/// count (`t0`, `t1`), the scratch buffer and the budget (`u0`, `u1`).
+/// Serialized here, not embedded by the compiler: Proton's compiler does not
+/// embed one.
+fn clamp_root(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let view = |kind, register| D3D12_ROOT_PARAMETER {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let parameters = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 6,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+        view(D3D12_ROOT_PARAMETER_TYPE_SRV, 1),
+        view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+        view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+    ];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: parameters.len() as u32,
+        pParameters: parameters.as_ptr(),
+        NumStaticSamplers: 0,
+        pStaticSamplers: std::ptr::null(),
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    let mut error: Option<ID3DBlob> = None;
+    // SAFETY: the description and its array live through the call; out
+    // pointers ours.
+    let serialized = unsafe {
+        D3D12SerializeRootSignature(
+            &desc,
+            D3D_ROOT_SIGNATURE_VERSION_1,
+            &mut blob,
+            Some(&mut error),
+        )
+    };
+    if serialized.is_err()
+        && let Some(error) = error
+    {
+        // SAFETY: the error blob owns its bytes.
+        let text = unsafe {
+            std::slice::from_raw_parts(error.GetBufferPointer().cast::<u8>(), error.GetBufferSize())
+        };
+        tracing::warn!(
+            "argument clamp root signature: {}",
+            String::from_utf8_lossy(text)
+        );
+    }
+    serialized?;
+    let blob = blob.ok_or_else(windows::core::Error::empty)?;
+    // SAFETY: the blob owns its bytes; CreateRootSignature copies them.
+    unsafe {
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
     }
 }
 
@@ -444,7 +527,8 @@ fn record_clamp_as(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            // One group walks the records (see the module's comment).
+            l.Dispatch(1, 1, 1);
         }
         l.ResourceBarrier(&second[skip..]);
     }
@@ -485,6 +569,7 @@ mod tests {
     use super::*;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
@@ -510,23 +595,24 @@ void main() {
         submitted: u64,
         event: HANDLE,
         clamp: Clamp,
-        worker: Clamp,
+        /// Counts the groups indirect dispatches run (an atomic add on a
+        /// byte-address buffer, with its root signature inside): `None`
+        /// where the system's compiler takes neither (Proton's).
+        worker: Option<Clamp>,
     }
 
     impl WarpHarness {
+        /// On WARP, or where there is none (Proton), on the default adapter:
+        /// the clamp is then compiled by Proton's compiler and run on the
+        /// card, as in a game run.
         fn new() -> Option<Self> {
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
-                let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                    return None;
-                }
-                let mut device: Option<ID3D12Device> = None;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-                let device = device?;
+                let device = Self::warp().or_else(|| {
+                    let mut device: Option<ID3D12Device> = None;
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                    device
+                })?;
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -541,8 +627,8 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
-                let clamp = make_for(&device).expect("clamp shader must compile on WARP");
-                let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
+                let clamp = make_for(&device).expect("the clamp must compile and be taken");
+                let worker = compile_cs(&device, WORKER_CS).ok();
                 Some(Self {
                     device,
                     queue,
@@ -554,6 +640,23 @@ void main() {
                     clamp,
                     worker,
                 })
+            }
+        }
+
+        /// A device on the software adapter, if there is one.
+        fn warp() -> Option<ID3D12Device> {
+            // SAFETY: plain DXGI queries and device creation.
+            unsafe {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+                let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                    return None;
+                }
+                let mut device: Option<ID3D12Device> = None;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                device
             }
         }
 
@@ -721,6 +824,11 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        // On the software adapter only: Proton's compiler refuses the
+        // compare (its atomics and root signature, as it did the clamp's).
+        if WarpHarness::warp().is_none() {
+            return;
+        }
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -904,19 +1012,21 @@ void main() {
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
         ));
-        // SAFETY: open command list, valid worker PSO/root and buffers.
-        unsafe {
-            warp.list.SetComputeRootSignature(&warp.worker.root);
-            warp.list.SetPipelineState(&warp.worker.pso);
-            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
-            warp.list.ExecuteIndirect(
-                &sig,
-                MAX,
-                &dst_buf,
-                0,
-                Some(&count_buf),
-                COUNT_OFFSET_1 as u64,
-            );
+        if let Some(worker) = &warp.worker {
+            // SAFETY: open command list, valid worker PSO/root and buffers.
+            unsafe {
+                warp.list.SetComputeRootSignature(&worker.root);
+                warp.list.SetPipelineState(&worker.pso);
+                warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                warp.list.ExecuteIndirect(
+                    &sig,
+                    MAX,
+                    &dst_buf,
+                    0,
+                    Some(&count_buf),
+                    COUNT_OFFSET_1 as u64,
+                );
+            }
         }
         done_on(&warp.list, &dst_buf);
 
@@ -949,19 +1059,21 @@ void main() {
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
         ));
-        // SAFETY: open command list, valid worker PSO/root and buffers.
-        unsafe {
-            warp.list.SetComputeRootSignature(&warp.worker.root);
-            warp.list.SetPipelineState(&warp.worker.pso);
-            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
-            warp.list.ExecuteIndirect(
-                &sig,
-                MAX,
-                &dst_buf,
-                0,
-                Some(&count_buf),
-                COUNT_OFFSET_2 as u64,
-            );
+        if let Some(worker) = &warp.worker {
+            // SAFETY: open command list, valid worker PSO/root and buffers.
+            unsafe {
+                warp.list.SetComputeRootSignature(&worker.root);
+                warp.list.SetPipelineState(&worker.pso);
+                warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                warp.list.ExecuteIndirect(
+                    &sig,
+                    MAX,
+                    &dst_buf,
+                    0,
+                    Some(&count_buf),
+                    COUNT_OFFSET_2 as u64,
+                );
+            }
         }
         done_on(&warp.list, &dst_buf);
 
@@ -984,10 +1096,12 @@ void main() {
         // Call #1: (3*2*1) + (5*1*1) + (65535*1*1) = 65,546 groups.
         // Call #2: (3*2*1) + (5*1*1) = 11 groups.
         let expected_groups = (6 + 5 + 65_535) + (6 + 5);
-        assert_eq!(
-            hits, expected_groups,
-            "valid indirect dispatches must all execute"
-        );
+        if warp.worker.is_some() {
+            assert_eq!(
+                hits, expected_groups,
+                "valid indirect dispatches must all execute"
+            );
+        }
         assert_eq!(
             spent,
             expected_groups * 64,

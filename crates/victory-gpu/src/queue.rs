@@ -1122,16 +1122,24 @@ mod tests {
         &rest[..end]
     }
 
+    /// Proton's compiler (vkd3d-shader) defines no `Interlocked*` method on
+    /// a byte-address buffer and embeds no root signature: a clamp that
+    /// used either did not compile there, and every indirect execution was
+    /// dropped.
     #[test]
-    fn indirect_clamp_does_not_call_interlocked_max() {
+    fn indirect_clamp_needs_no_atomics_or_embedded_root_signature() {
         let clamp = hlsl(include_str!("indirect.rs"), "SOURCE");
         assert!(
-            !clamp.contains("InterlockedMax"),
-            "SM 5.1 byte-address buffers have no InterlockedMax"
+            !clamp.contains("Interlocked"),
+            "the clamp must charge the budget without atomics"
         );
         assert!(
-            clamp.contains("budget.InterlockedCompareExchange(4, was, g.x, prev)"),
-            "the diagnostic max must use a compare/exchange loop"
+            !clamp.contains("[RootSignature("),
+            "the clamp's root signature is serialized in code"
+        );
+        assert!(
+            include_str!("indirect.rs").contains("D3D12SerializeRootSignature("),
+            "the clamp must serialize its own root signature"
         );
     }
 
