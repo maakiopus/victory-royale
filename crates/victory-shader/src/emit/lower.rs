@@ -473,6 +473,25 @@ fn need(block: usize) {
     });
 }
 
+/// A scalar bitwise operation over lane masks, named without its `s_` prefix
+/// and width suffix: the operation, whether it complements its second
+/// operand, and whether it complements its result. GFX10 has no plain
+/// `s_andn1`/`s_orn1`, only their `saveexec` and `wrexec` forms, which write
+/// EXEC and are refused before this.
+fn bitwise(op: &str) -> Option<(Bin, bool, bool)> {
+    Some(match op {
+        "and" => (Bin::And, false, false),
+        "or" => (Bin::Or, false, false),
+        "xor" => (Bin::Xor, false, false),
+        "andn2" => (Bin::And, true, false),
+        "orn2" => (Bin::Or, true, false),
+        "nand" => (Bin::And, false, true),
+        "nor" => (Bin::Or, false, true),
+        "xnor" => (Bin::Xor, false, true),
+        _ => return None,
+    })
+}
+
 /// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
 /// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
 /// constants and such values; or loaded from an address made of them. The compiler keeps
@@ -3246,11 +3265,17 @@ impl<'a> Lower<'a> {
         let made = self.def_block.get(&lo).copied();
         let whole =
             self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
-        if !self.x.st.active.contains(&lo) && !whole {
-            if self.exchange.is_some() && !self.local {
-                need(made.unwrap_or(0));
-            }
-            return Err(MASK_ELSEWHERE);
+        let balloted = self.x.st.active.contains(&lo) || whole || self.ballots.contains_key(&lo);
+        if !balloted {
+            // No ballot anywhere gives this mask. With console lanes the
+            // scalar operation that wrote it, applied to its operands'
+            // numbers, does: that is what the console computed.
+            let xy = self.mask_number(lo).inspect_err(|_| {
+                if self.exchange.is_some() && !self.local {
+                    need(made.unwrap_or(0));
+                }
+            })?;
+            self.ballots.insert(lo, xy);
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
@@ -3295,6 +3320,127 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Both dwords of a mask holding lanes that do not reach the block
+    /// writing it (a complement, or a copy made where EXEC is not known), so
+    /// no ballot there gives it: with console lanes, the scalar operation
+    /// that writes it applied to its operands' numbers, as the console does.
+    ///
+    /// Only with console lanes (compute declaring the console's wave size),
+    /// where a host lane is the console lane of the same number and each
+    /// operand's number is the console's bit for bit.
+    fn mask_number(&mut self, lo: Value) -> Result<(V, V), Why> {
+        if self.mask_data != MaskData::Console {
+            return Err(MASK_ELSEWHERE);
+        }
+        let p = self.x.p;
+        // A register the compiler reuses: a mask on one path, data on another.
+        if let Some(&(b, i)) = self.phi_at.get(&lo)
+            && p.blocks[b].phis[i]
+                .args
+                .iter()
+                .any(|a| !self.x.st.masks.contains_key(a))
+        {
+            return Err("a register joining a lane mask and data, read as data");
+        }
+        let &b = self.def_block.get(&lo).ok_or(MASK_ELSEWHERE)?;
+        let inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == lo))
+            .ok_or(MASK_ELSEWHERE)?;
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            src,
+            ..
+        } = &inst.fields
+        else {
+            return Err(MASK_ELSEWHERE);
+        };
+        // The low dword must be the destination's, and an EXEC write is the
+        // pass's own business (`s_*_saveexec`), not a mask over operands.
+        if inst.write(Reg::S(*code)) != Some(lo) || inst.write(Reg::S(EXEC)).is_some() {
+            return Err(MASK_ELSEWHERE);
+        }
+        let wave64 = self.x.p.wave64;
+        let width = if wave64 { "_b64" } else { "_b32" };
+        let op = inst
+            .name()
+            .strip_prefix("s_")
+            .and_then(|n| n.strip_suffix(width))
+            .ok_or(MASK_ELSEWHERE)?;
+        let at = if b == self.cur_ir {
+            self.cur
+        } else {
+            self.tail[b].ok_or("a lane mask written after its use")?
+        };
+        let mut out = [self.s.m.i32(0); 2];
+        for h in 0..1 + u8::from(wave64) {
+            let a = self.mask_word(inst, src, 0, h)?;
+            let ones = self.s.m.i32(u32::MAX);
+            out[usize::from(h)] = match op {
+                "mov" => a,
+                "not" => self.s.m.bin(at, Bin::Xor, a, ones),
+                "cselect" => {
+                    let c = self.mask_word(inst, src, 1, h)?;
+                    let cond = self.mask_scc(inst, at)?;
+                    self.s.m.select(at, cond, a, c)
+                }
+                _ => {
+                    let c = self.mask_word(inst, src, 1, h)?;
+                    let (f, not_c, not_r) = bitwise(op).ok_or(MASK_ELSEWHERE)?;
+                    let c = if not_c {
+                        self.s.m.bin(at, Bin::Xor, c, ones)
+                    } else {
+                        c
+                    };
+                    let r = self.s.m.bin(at, f, a, c);
+                    if not_r {
+                        self.s.m.bin(at, Bin::Xor, r, ones)
+                    } else {
+                        r
+                    }
+                }
+            };
+        }
+        Ok((out[0], out[1]))
+    }
+
+    /// Dword `h` of operand `k` of a mask-making scalar operation; inline
+    /// constants sign-extend into the high dword, a literal does not.
+    fn mask_word(&mut self, inst: &Inst, src: &[Operand], k: usize, h: u8) -> Result<V, Why> {
+        let x = match src.get(k) {
+            Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                let v = inst.read(Reg::S(code + h)).ok_or(MASK_ELSEWHERE)?;
+                return self.i32_of(v);
+            }
+            Some(&Operand::Const(c)) => {
+                let x = crate::resource::inline(c).ok_or(MASK_ELSEWHERE)?;
+                match h {
+                    0 => x,
+                    _ if (x as i32) < 0 => u32::MAX,
+                    _ => 0,
+                }
+            }
+            Some(&Operand::Literal(x)) if h == 0 => x,
+            Some(Operand::Literal(_)) => 0,
+            _ => return Err(MASK_ELSEWHERE),
+        };
+        Ok(self.s.m.i32(x))
+    }
+
+    /// The SCC an `s_cselect` reads, as a one-bit condition in block `at`.
+    fn mask_scc(&mut self, inst: &Inst, at: usize) -> Result<V, Why> {
+        let scc = inst.read(Reg::Scc).ok_or(MASK_ELSEWHERE)?;
+        match self.get(scc)? {
+            Val::Bit(x) => Ok(x),
+            Val::I32(x) => {
+                let z = self.s.m.i32(0);
+                Ok(self.s.m.cmp(at, pred::NE, x, z))
+            }
+            Val::Missing(why) => Err(why),
+        }
     }
 
     // ---- operands ----
