@@ -91,6 +91,8 @@ mod insn_lower_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 mod lower;
+#[cfg(test)]
+mod lower_tests;
 mod own_bits;
 mod rect;
 mod sampler;
