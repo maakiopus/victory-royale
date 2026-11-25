@@ -983,22 +983,82 @@ float4 corner(uint i : SV_VertexID) : SV_Position {
     return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0);
 }
 "#;
+/// The pixel shader reads one `t0` array. The root signature is built with
+/// D3D12SerializeRootSignature, not embedded by FXC: a serialized signature
+/// from the title's D3D compiler is not a portable one for this pipeline.
 const PLANE_STEPS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<uint> twin : register(t0);
-[RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
     return float(twin.Load(int4(int2(p.xy), 0, 0))) * asfloat(0x37800080);
 }
 "#;
 const PLANE_FLOATS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<float> twin : register(t0);
-[RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
     return twin.Load(int4(int2(p.xy), 0, 0));
 }
 "#;
+
+/// Builds the one-table root signature the plane pixel shaders expect,
+/// independently of the compiler's root-signature embedding.
+fn plane_root(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    let ranges = [D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 1,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: 0,
+    }];
+    let parameters = [D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: ranges.as_ptr(),
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+    }];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: 1,
+        pParameters: parameters.as_ptr(),
+        NumStaticSamplers: 0,
+        pStaticSamplers: std::ptr::null(),
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    let mut error: Option<ID3DBlob> = None;
+    // SAFETY: desc and its arrays are alive through the call; out pointers ours.
+    let serialized = unsafe {
+        D3D12SerializeRootSignature(
+            &desc,
+            D3D_ROOT_SIGNATURE_VERSION_1,
+            &mut blob,
+            Some(&mut error),
+        )
+    };
+    if serialized.is_err()
+        && let Some(error) = error
+    {
+        // SAFETY: the error blob owns its bytes.
+        let text = unsafe {
+            std::slice::from_raw_parts(error.GetBufferPointer().cast::<u8>(), error.GetBufferSize())
+        };
+        tracing::warn!(
+            "a root signature of ours: {}",
+            String::from_utf8_lossy(text)
+        );
+    }
+    serialized?;
+    let blob = blob.ok_or_else(windows::core::Error::empty)?;
+    // SAFETY: the blob owns its bytes; CreateRootSignature copies them.
+    unsafe {
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
 
 /// Views of twins the pass reads, in a heap of ours used as a ring.
 /// shortcut: a view must last until its list has run; with one or two
@@ -1137,10 +1197,10 @@ impl PlanePass {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         };
-        // SAFETY: the root signature is inside the pixel shader; the
-        // description points at live data and never releases its pointer.
+        // Serialize the signature ourselves instead of trusting the one FXC
+        // embedded in the pixel shader. The description points at live data.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let root = plane_root(device)?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
@@ -6972,7 +7032,10 @@ impl Host {
             }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            // A frame without a pixel probe has no observation to report.
+            // Reporting `Some(false)` here would make the next dark probed
+            // frame look like a transition from a non-black frame.
+            return probe.map(|b| crate::capture::black(&b));
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }

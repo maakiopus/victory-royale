@@ -101,8 +101,17 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         // Diagnostics, in the budget buffer's next words: the largest
         // group count a mesh record asked for, and the groups asked in all.
+        // FXC's SM 5.1 byte-address buffers have no atomic maximum, so use a
+        // compare/exchange loop, as the budget reservation just below does.
         uint was;
-        budget.InterlockedMax(4, g.x, was);
+        budget.InterlockedAdd(4, 0u, was);
+        [allow_uav_condition]
+        while (was < g.x) {
+            uint prev;
+            budget.InterlockedCompareExchange(4, was, g.x, prev);
+            if (prev == was) break;
+            was = prev;
+        }
         budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
