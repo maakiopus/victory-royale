@@ -233,8 +233,9 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// dynamic slot, and the [`crate::shadow::buffer_generation`] at which
+    /// its buffer views last showed their host copies.
+    fresh_tables: std::collections::HashMap<(u64, u32, u64), (u32, u64)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -1435,25 +1436,25 @@ impl State {
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
-        // One key per list, as textures have: no title resource is there.
-        const ONCE: usize = usize::MAX - 0x5e;
-        if !list.first_use(ONCE) {
+        // Once per list and heap: a list may bind another heap later, whose
+        // stride table it must hold too (DexNom `5f4c3df`).
+        let strides = host.strides_buffer()?;
+        if !list.first_use(strides.as_raw() as usize) {
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.
-        if let Some(buffer) = host.strides_buffer() {
-            list.keep(buffer);
-        }
-        // The pass itself once per frame: per list it ran up to 51 times a
-        // frame over 81,000 views and 4,100 host copies, 18 s of every
-        // frame (2026-11-24, run 11).
+        list.keep(strides);
+        // The pass itself once per frame and heap: per list it ran up to 51
+        // times a frame over 81,000 views and 4,100 host copies, 18 s of
+        // every frame (2026-11-24, run 11).
         // shortcut: what the title writes into such buffers between lists
         // of one frame is seen a frame late.
-        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        let mut pass = host.buffer_pass.lock().unwrap_or_else(|e| e.into_inner());
+        if pass.frame == Some(frame) {
             return Some(gpu);
         }
+        pass.frame = Some(frame);
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
@@ -1461,15 +1462,7 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges =
-            std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
-            .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+        let crate::descriptor::host::BufferPass { passes, ranges, .. } = &mut *pass;
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
             ranges.clear();
@@ -1537,7 +1530,7 @@ impl State {
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
-        drop(kept);
+        drop(pass);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -2146,14 +2139,18 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            if builder {
+                crate::pipeline::builder_off("a builder stage was explicitly skipped");
+            }
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if builder && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
@@ -2169,6 +2166,9 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            if builder {
+                crate::pipeline::builder_off("a builder dispatch has no host pipeline");
+            }
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
@@ -2185,7 +2185,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
-            if crate::pipeline::is_builder(self.pipeline as This) {
+            if builder {
                 crate::pipeline::builder_off("one of its dispatches could not be bound");
             }
             return;
@@ -2781,7 +2781,21 @@ impl State {
                 }
                 (table, n, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            // A table made before a title buffer was made or released over
+            // the memory of one of its views shows the old host copy: made
+            // afresh then (DexNom `5f4c3df`). An earlier draw of the list
+            // may still read the old slots, which the list holds.
+            let generation = crate::shadow::buffer_generation();
+            if let Some((first, checked)) = self.fresh_tables.get_mut(&key)
+                && (*checked == generation
+                    || !crate::descriptor::host::owner_checks()
+                    || (0..n).all(|k| {
+                        crate::descriptor::view(table + u64::from(k) * 32)
+                            .is_none_or(|view| host.buffer_owner_current(*first + k, &view))
+                    }))
+            {
+                *checked = generation;
+                let first = *first;
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -2808,7 +2822,7 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            self.fresh_tables.insert(key, (first, generation));
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -3080,6 +3094,14 @@ impl State {
 }
 
 impl State {
+    /// An indirect execution whose signature or argument buffer the host
+    /// cannot read: for a builder stage, the builder stops.
+    pub(crate) fn invalid_indirect(&self) {
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::pipeline::builder_off("invalid builder indirect signature or argument buffer");
+        }
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -3094,6 +3116,11 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        // A builder stage dispatched indirectly that cannot run is a
+        // dropped stage too (DexNom `5f4c3df`).
+        if kind == 2 && max != 0 && !ran && crate::pipeline::is_builder(self.pipeline as This) {
+            crate::pipeline::builder_off("an indirect builder dispatch could not run");
+        }
         // A listed frame: what the records of one that did not run asked
         // for (a dropped execution of many meshes is a whole class of
         // geometry missing; an empty one is no loss).

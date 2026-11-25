@@ -263,7 +263,6 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
-    let numbered = m.copies.len();
     for &address in addresses {
         m.name(address);
     }
@@ -282,24 +281,22 @@ pub(crate) fn ready(
         }
     }
     let (base, count) = heap.raw_page_views(&m.copies)?;
-    // Once per list, and for copies numbered since: the builder alone
-    // dispatches hundreds of times a frame.
-    // shortcut: a copy another list numbers meanwhile is brought up to date
-    // by that list's submission, which may run after this one's.
+    // Per list, the copies it has not brought up to date (or copied back)
+    // yet: the builder alone dispatches hundreds of times a frame. A copy
+    // another list numbered is this list's to bring up to date too: that
+    // list may be submitted after this one (DexNom `5f4c3df`). A title copy
+    // recorded since starts the list's count over.
     const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
-    let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
+    let (reads, written) = list.raw_memory_ranges(m.copies.len(), writes);
+    for shadow in &m.copies[reads] {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
-        }
-        if writes && (first_write || n >= numbered) {
-            shadow.gpu_writes(list, start, len);
-        }
+        shadow.refresh(list, start, len);
     }
-    if first_read {
+    for shadow in &m.copies[written] {
+        let (start, len) = shadow.span();
+        shadow.gpu_writes(list, start, len);
+    }
+    if list.first_use(READ) {
         list.keep(&m.directory.0);
         list.keep(&m.faults.0);
     }

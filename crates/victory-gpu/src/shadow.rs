@@ -3113,6 +3113,15 @@ struct Entry {
 
 /// Title buffers by (start address, resource), with their copy once made.
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// Counts the changes to [`BUFFERS`] that can give an unchanged buffer view
+/// another host copy: a title buffer made, released or let go of in place.
+static BUFFER_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Changes whenever the same title buffer view can resolve to another host
+/// copy ([`crate::descriptor::host::HostHeap::buffer_owner_current`]).
+pub(crate) fn buffer_generation() -> u64 {
+    BUFFER_GENERATION.load(Ordering::Acquire)
+}
 
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
@@ -3127,11 +3136,14 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    BUFFER_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    if buffers().remove(&(start, resource)).is_some() {
+        BUFFER_GENERATION.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -3172,6 +3184,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n != 0 {
+        BUFFER_GENERATION.fetch_add(1, Ordering::Release);
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }

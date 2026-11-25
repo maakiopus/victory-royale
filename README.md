@@ -169,6 +169,8 @@ Rendering:
 - The ray-tracing memory directory can grow past 1,023 backing buffers: each recorded draw or dispatch keeps the view count it was recorded with, and newer recordings can use more views.
 - Streamed textures can upload when only their middle pages are resident; overlapping memory notifications are merged and tracked textures are rescanned when the notification queue fills.
 - Depth-only pipelines are warmed ahead of speculative material pipelines, so shadow maps are prepared earlier.
+- Textures picked by index: when a pass runs out of time after a few slots, the slots waiting for a retry and the ones never looked at take turns from frame to frame, so newly streamed textures are not starved by a retry backlog. A buffer view whose memory gets a new title buffer (or loses one) is made again on the new host copy, also in per-draw tables; a view the old copy had to leave null is retried (`VICTORY_BUFFER_OWNERS=0` turns it off). Each view heap keeps its own pass over its buffer views.
+- The ray-tracing structure builder stops as a whole when one of its stages cannot run, including an indirect dispatch; each list brings up to date every numbered copy of title memory it reads, including copies another list numbered.
 - Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
 
 Speed and memory:
@@ -178,6 +180,7 @@ Speed and memory:
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+- Opt-in CPU submission workers: `VICTORY_FILL_WORKERS=2..6` shares long runs of upload fills among workers, and `VICTORY_PARALLEL_PRELUDES=1` records the state preludes of four or more lists on workers; the card still gets every list in submission order. Off by default.
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
